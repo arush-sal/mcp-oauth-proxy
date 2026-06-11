@@ -93,6 +93,22 @@ type Config struct {
 	EnableMetrics  bool
 	MetricsPath    string
 	MetricsAddress string
+
+	// Dynamic Client Registration (DCR) toggle (F2). Controls whether the
+	// /register endpoint accepts new client registrations and whether the
+	// authorization-server metadata advertises a registration_endpoint.
+	//
+	// It is a tri-state pointer so an unset value (nil) preserves today's
+	// behavior (DCR ENABLED). Resolve it through DCREnabled(), never read the
+	// pointer directly. When disabled, /register returns 403 and metadata omits
+	// the registration endpoint; pre-existing stored clients keep working.
+	EnableDynamicClientRegistration *bool
+}
+
+// DCREnabled reports whether Dynamic Client Registration is enabled. An unset
+// (nil) value defaults to true so existing configs preserve today's behavior.
+func (c *Config) DCREnabled() bool {
+	return c.EnableDynamicClientRegistration == nil || *c.EnableDynamicClientRegistration
 }
 
 // HealthMetricsConfig is the resolved health/metrics policy derived from the

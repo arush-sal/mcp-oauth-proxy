@@ -17,18 +17,33 @@ type ClientStore interface {
 	StoreClient(client *types.ClientInfo) error
 }
 
-func NewHandler(db ClientStore) http.Handler {
+// NewHandler builds the /register Dynamic Client Registration handler. When
+// enabled is false the handler is mounted but rejects every request with 403
+// (see ServeHTTP) so DCR can be turned off without unmounting the route.
+func NewHandler(db ClientStore, enabled bool) http.Handler {
 	return &Handler{
-		db: db,
+		db:      db,
+		enabled: enabled,
 	}
 }
 
 type Handler struct {
-	db ClientStore
+	db      ClientStore
+	enabled bool
 }
 
 func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Client registration is always enabled when this endpoint is accessible
+	// Dynamic Client Registration toggle (F2). When disabled, reject with 403
+	// Forbidden so callers can tell the endpoint exists but is turned off
+	// (clearer than a 404). Pre-existing stored clients are untouched and keep
+	// working for the authorize/token flows.
+	if !p.enabled {
+		handlerutils.JSON(w, http.StatusForbidden, types.OAuthError{
+			Error:            "access_denied",
+			ErrorDescription: "dynamic client registration is disabled",
+		})
+		return
+	}
 
 	// Only allow POST method
 	if r.Method != "POST" {
