@@ -697,6 +697,16 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 // when configured to do so. This makes both call sites (the proxy Director and
 // forward_auth mode) consistent and spoof-safe.
 func (p *OAuthProxy) setHeaders(header http.Header, props map[string]any) {
+	// F3: optional inbound header hygiene. When enabled, strip the full family of
+	// client-supplied identity / forwarded headers (including the configured
+	// ID_TOKEN_HEADER and headers the proxy does not otherwise manage) BEFORE
+	// writing the proxy's own derived headers below, so spoofed inbound values
+	// cannot survive. Default (disabled) leaves the broader set untouched; only
+	// the four managed headers + Authorization are neutralized as before.
+	if p.config != nil && p.config.StripInboundIdentityHeaders {
+		p.forwardCfg.stripInboundIdentityHeaders(header)
+	}
+
 	header.Del(authorizationHeader)
 
 	if userID, ok := props["user_id"].(string); ok {

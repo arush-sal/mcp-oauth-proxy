@@ -49,6 +49,9 @@ type RootCmd struct {
 	AuthorizationHeaderToken string `name:"authorization-header-token" env:"AUTHORIZATION_HEADER_TOKEN" usage:"Which token to place on the upstream Authorization header: 'none' (default), 'access_token', or 'id_token'" default:"none"`
 	IDTokenHeader            string `name:"id-token-header" env:"ID_TOKEN_HEADER" usage:"Optional custom header to carry the raw verified id_token (no 'Bearer ' prefix). When empty and forwarding id_token, uses 'Authorization: Bearer <id_token>'"`
 
+	// Inbound header hygiene (F3). Default false preserves current behavior.
+	StripInboundIdentityHeaders bool `name:"strip-inbound-identity-headers" env:"STRIP_INBOUND_IDENTITY_HEADERS" usage:"Strip client-supplied identity/forwarded headers (X-Forwarded-*, X-Auth-Request-*, the configured ID_TOKEN_HEADER) from the upstream request so a caller cannot spoof identity. The four proxy-managed X-Forwarded-* headers + Authorization are always neutralized regardless"`
+
 	// Scopes and MCP configuration
 	ScopesSupported string `name:"scopes-supported" env:"SCOPES_SUPPORTED" usage:"Comma-separated list of supported OAuth scopes (e.g., 'openid,profile,email')" required:"true"`
 	MCPServerURL    string `name:"mcp-server-url" env:"MCP_SERVER_URL" usage:"URL of the MCP server to proxy requests to" required:"true"`
@@ -126,6 +129,8 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 
 		AuthorizationHeaderToken: c.AuthorizationHeaderToken,
 		IDTokenHeader:            c.IDTokenHeader,
+
+		StripInboundIdentityHeaders: c.StripInboundIdentityHeaders,
 
 		CookieExpire:   c.CookieExpire,
 		CookieRefresh:  c.CookieRefresh,

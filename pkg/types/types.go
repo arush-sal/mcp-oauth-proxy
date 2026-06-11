@@ -60,6 +60,16 @@ type Config struct {
 	AuthorizationHeaderToken string
 	IDTokenHeader            string
 
+	// StripInboundIdentityHeaders (F3) toggles inbound header hygiene. When true,
+	// the proxy DELETES the full family of client-supplied identity / forwarded
+	// headers from the outbound (upstream) request before writing its own, so a
+	// caller cannot spoof identity to an upstream that trusts headers the proxy
+	// does not otherwise manage (e.g. X-Forwarded-Groups, X-Auth-Request-*). The
+	// runtime-configured IDTokenHeader is included in the stripped set. Default
+	// false preserves current behavior: only the four proxy-managed X-Forwarded-*
+	// headers + Authorization are neutralized.
+	StripInboundIdentityHeaders bool
+
 	// Session & cookie lifetime / security (F5). These are RAW, unparsed
 	// strings resolved once at startup by ResolveSessionConfig into a
 	// SessionConfig. Empty values fall back to defaults that reproduce the
