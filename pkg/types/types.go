@@ -113,12 +113,34 @@ type Config struct {
 	// pointer directly. When disabled, /register returns 403 and metadata omits
 	// the registration endpoint; pre-existing stored clients keep working.
 	EnableDynamicClientRegistration *bool
+
+	// TrustForwardedHeaders controls whether client-supplied forwarded headers
+	// (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto) are trusted when deriving the
+	// external base URL, which feeds redirect URIs, OAuth metadata, and the
+	// resource_metadata in the WWW-Authenticate challenge.
+	//
+	// It is a tri-state pointer so an unset value (nil) preserves today's
+	// behavior (forwarded headers TRUSTED). Resolve it through
+	// TrustForwardedHeadersEnabled(), never read the pointer directly. Set it to
+	// false when the proxy is NOT behind a trusted reverse proxy: the proxy then
+	// does NOT trust those forwarded headers and derives the external base URL
+	// from the connection (TLS) and the request Host header. Note that the Host
+	// header itself should be constrained by a fronting reverse proxy /
+	// allowed-host config at the infrastructure layer.
+	TrustForwardedHeaders *bool
 }
 
 // DCREnabled reports whether Dynamic Client Registration is enabled. An unset
 // (nil) value defaults to true so existing configs preserve today's behavior.
 func (c *Config) DCREnabled() bool {
 	return c.EnableDynamicClientRegistration == nil || *c.EnableDynamicClientRegistration
+}
+
+// TrustForwardedHeadersEnabled reports whether client-supplied forwarded
+// headers should be trusted when deriving the external base URL. An unset
+// (nil) value defaults to true so existing configs preserve today's behavior.
+func (c *Config) TrustForwardedHeadersEnabled() bool {
+	return c.TrustForwardedHeaders == nil || *c.TrustForwardedHeaders
 }
 
 // HealthMetricsConfig is the resolved health/metrics policy derived from the
