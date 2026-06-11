@@ -1,11 +1,16 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/gptscript-ai/cmd"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/proxy"
@@ -63,6 +68,14 @@ type RootCmd struct {
 	Host        string `name:"host" env:"HOST" usage:"Host to bind the server to" default:"localhost"`
 	RoutePrefix string `name:"route-prefix" env:"ROUTE_PREFIX" usage:"Optional prefix for all routes (e.g., '/oauth2')"`
 
+	// Health & metrics (F6). Probes are always on at root paths; metrics are
+	// off by default. Defaults preserve existing behavior (legacy /health stays).
+	HealthPath     string `name:"health-path" env:"HEALTH_PATH" usage:"Liveness probe path (returns 200 unconditionally)" default:"/healthz"`
+	ReadyPath      string `name:"ready-path" env:"READY_PATH" usage:"Readiness probe path (200 when the database is reachable, 503 otherwise)" default:"/readyz"`
+	EnableMetrics  bool   `name:"enable-metrics" env:"ENABLE_METRICS" usage:"Enable Prometheus metrics endpoint"`
+	MetricsPath    string `name:"metrics-path" env:"METRICS_PATH" usage:"Path for the Prometheus metrics endpoint" default:"/metrics"`
+	MetricsAddress string `name:"metrics-address" env:"METRICS_ADDRESS" usage:"When set (e.g. ':9090'), serve metrics on a SEPARATE listener at this address instead of the main mux"`
+
 	// Logging
 	Verbose bool `name:"verbose,v" usage:"Enable verbose logging"`
 	Version bool `name:"version" usage:"Show version information"`
@@ -112,6 +125,12 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		CookieRefresh:  c.CookieRefresh,
 		CookieSecure:   c.CookieSecure,
 		CookieSameSite: c.CookieSameSite,
+
+		HealthPath:     c.HealthPath,
+		ReadyPath:      c.ReadyPath,
+		EnableMetrics:  c.EnableMetrics,
+		MetricsPath:    c.MetricsPath,
+		MetricsAddress: c.MetricsAddress,
 	}
 
 	// Validate configuration
@@ -133,6 +152,14 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 	// Get HTTP handler
 	handler := oauthProxy.GetHandler()
 
+	// Tie the proxy's background lifecycle (token cleanup, JWKS refresh) and the
+	// servers below to OS signals so everything shuts down cleanly together.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := oauthProxy.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start proxy background tasks: %w", err)
+	}
+
 	// Start server
 	address := fmt.Sprintf("%s:%s", c.Host, c.Port)
 	log.Printf("Starting OAuth proxy server on %s", address)
@@ -140,7 +167,74 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 	log.Printf("MCP Server: %s", c.MCPServerURL)
 	log.Printf("Database: %s", c.getDatabaseType())
 
-	return http.ListenAndServe(address, handler)
+	mainServer := &http.Server{Addr: address, Handler: handler}
+
+	// Optionally start a SEPARATE metrics listener (METRICS_ADDRESS). When
+	// metrics are enabled but no address is configured, the metrics endpoint is
+	// served on the main mux instead and no second listener is started.
+	var metricsServer *http.Server
+	hmCfg := oauthProxy.HealthMetricsConfig()
+	if hmCfg.MetricsOnSeparateListener() {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle(hmCfg.MetricsPath, oauthProxy.MetricsHandler())
+		metricsServer = &http.Server{Addr: hmCfg.MetricsAddress, Handler: metricsMux}
+		go func() {
+			log.Printf("Starting metrics server on %s%s", hmCfg.MetricsAddress, hmCfg.MetricsPath)
+			if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("Metrics server error: %v", err)
+			}
+		}()
+	}
+
+	// Run the main server in a goroutine so we can wait on the signal context
+	// and shut down gracefully.
+	serverErr := make(chan error, 1)
+	go func() {
+		if err := mainServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	select {
+	case err := <-serverErr:
+		// The main server exited on its own (e.g. bind failure).
+		c.shutdownMetrics(metricsServer)
+		return err
+	case <-ctx.Done():
+		// Signal received: gracefully drain both servers.
+		log.Println("Shutdown signal received, draining servers...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := mainServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Main server shutdown error: %v", err)
+		}
+		c.shutdownMetricsCtx(shutdownCtx, metricsServer)
+		return nil
+	}
+}
+
+// shutdownMetrics gracefully shuts down the metrics server (if any) with its
+// own short timeout. Used when the main server exits unexpectedly.
+func (c *RootCmd) shutdownMetrics(metricsServer *http.Server) {
+	if metricsServer == nil {
+		return
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.shutdownMetricsCtx(shutdownCtx, metricsServer)
+}
+
+// shutdownMetricsCtx gracefully shuts down the metrics server (if any) using
+// the provided context.
+func (c *RootCmd) shutdownMetricsCtx(ctx context.Context, metricsServer *http.Server) {
+	if metricsServer == nil {
+		return
+	}
+	if err := metricsServer.Shutdown(ctx); err != nil {
+		log.Printf("Metrics server shutdown error: %v", err)
+	}
 }
 
 // parseCommaList splits a comma-separated string into a trimmed, non-empty
@@ -181,6 +275,19 @@ func (c *RootCmd) validateConfig() error {
 		} else if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
 			return fmt.Errorf("MCP server URL must not contain a path, query, or fragment")
 		}
+	}
+	// Reject health/metrics path collisions and malformed paths up front so the
+	// process fails with a clear error instead of panicking http.ServeMux during
+	// route setup. Validate the RESOLVED policy so defaults are applied first.
+	hmCfg := types.ResolveHealthMetricsConfig(&types.Config{
+		HealthPath:     c.HealthPath,
+		ReadyPath:      c.ReadyPath,
+		EnableMetrics:  c.EnableMetrics,
+		MetricsPath:    c.MetricsPath,
+		MetricsAddress: c.MetricsAddress,
+	})
+	if err := hmCfg.Validate(); err != nil {
+		return fmt.Errorf("invalid health/metrics configuration: %w", err)
 	}
 	return nil
 }

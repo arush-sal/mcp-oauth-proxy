@@ -51,6 +51,15 @@ type OAuthProxy struct {
 	forwardCfg      forwardConfig
 	sessionCfg      types.SessionConfig
 
+	// Health & metrics (F6). healthMetricsCfg holds the resolved policy
+	// (defaulted paths + the metrics-location decision). readinessPing is the
+	// dependency check run by the readiness probe; it defaults to the DB ping
+	// and is overridable in tests. metrics holds the Prometheus registry and
+	// instruments; it is non-nil only when metrics are enabled.
+	healthMetricsCfg types.HealthMetricsConfig
+	readinessPing    func(context.Context) error
+	metrics          *metricsBundle
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -188,22 +197,37 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 	// to context.Background().
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &OAuthProxy{
-		metadata:      metadata,
-		db:            db,
-		rateLimiter:   rateLimiter,
-		providers:     providerManager,
-		tokenManager:  tokenManager,
-		provider:      provider,
-		resourceName:  "MCP Tools",
-		encryptionKey: encryptionKey,
-		config:        config,
-		authorizer:    authorizer,
-		forwardCfg:    forwardCfg,
-		sessionCfg:    sessionCfg,
-		ctx:           ctx,
-		cancel:        cancel,
-	}, nil
+	// Resolve the health/metrics policy (defaulted paths + metrics-location
+	// decision). When metrics are enabled, build the Prometheus registry +
+	// instruments up front so they exist regardless of where the handler is
+	// mounted (main mux or a separate listener).
+	healthMetricsCfg := types.ResolveHealthMetricsConfig(config)
+	var metrics *metricsBundle
+	if healthMetricsCfg.EnableMetrics {
+		metrics = newMetricsBundle()
+	}
+
+	p := &OAuthProxy{
+		metadata:         metadata,
+		db:               db,
+		rateLimiter:      rateLimiter,
+		providers:        providerManager,
+		tokenManager:     tokenManager,
+		provider:         provider,
+		resourceName:     "MCP Tools",
+		encryptionKey:    encryptionKey,
+		config:           config,
+		authorizer:       authorizer,
+		forwardCfg:       forwardCfg,
+		sessionCfg:       sessionCfg,
+		healthMetricsCfg: healthMetricsCfg,
+		metrics:          metrics,
+		ctx:              ctx,
+		cancel:           cancel,
+	}
+	// Default the readiness check to a real DB ping; tests may override it.
+	p.readinessPing = p.db.Ping
+	return p, nil
 }
 
 // buildIDTokenVerifier constructs the OIDC id_token verifier from the provider
@@ -312,14 +336,21 @@ func (p *OAuthProxy) Start(ctx context.Context) error {
 		})
 	}
 
-	// Setup cleanup goroutine for expired tokens
+	// Setup cleanup goroutine for expired tokens. Stop both the ticker AND the
+	// goroutine when the proxy context is cancelled: time.Ticker.Stop() does not
+	// close ticker.C, so a bare `for range ticker.C` would block forever after
+	// cancellation and leak the goroutine. Select on ctx.Done() instead.
 	go func() {
 		ticker := time.NewTicker(time.Hour) // Cleanup every hour
 		defer ticker.Stop()
-		context.AfterFunc(p.ctx, ticker.Stop)
-		for range ticker.C {
-			if err := p.db.CleanupExpiredTokens(); err != nil {
-				log.Printf("Failed to cleanup expired tokens: %v", err)
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+				if err := p.db.CleanupExpiredTokens(); err != nil {
+					log.Printf("Failed to cleanup expired tokens: %v", err)
+				}
 			}
 		}
 	}()
@@ -360,6 +391,14 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 
 	mux.HandleFunc("GET "+prefix+"/health", p.withCORS(p.healthHandler))
 
+	// Health & metrics endpoints (F6). These are registered at the ROOT (never
+	// under RoutePrefix) so probes have stable paths, mirroring how the
+	// .well-known/* metadata is mounted. They are exact paths so they do not
+	// collide with the catch-all "/{path...}" proxy route, and they are NOT
+	// wrapped in withRateLimit or token validation so probes always work
+	// unauthenticated. CORS is applied for consistency.
+	p.registerHealthMetricsRoutes(mux)
+
 	// OAuth endpoints
 	mux.HandleFunc("GET "+prefix+"/authorize", p.withCORS(p.withRateLimit(authorizeHandler)))
 	mux.HandleFunc("GET "+prefix+"/callback", p.withCORS(p.withRateLimit(callbackHandler)))
@@ -387,6 +426,13 @@ func (p *OAuthProxy) GetHandler() http.Handler {
 
 	// Wrap with logging middleware
 	loggedHandler := handlers.LoggingHandler(os.Stdout, mux)
+
+	// Instrument the whole handler with Prometheus middleware when metrics are
+	// enabled. This counts every request (by code/method) and records request
+	// duration, including the probe and metrics endpoints themselves.
+	if p.metrics != nil {
+		return p.metrics.instrument(loggedHandler)
+	}
 
 	return loggedHandler
 }
