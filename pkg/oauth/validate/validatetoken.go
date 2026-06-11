@@ -417,14 +417,6 @@ func GetTokenInfo(r *http.Request) *tokens.TokenInfo {
 	return v
 }
 
-// ContextWithTokenInfo returns a context carrying tokenInfo under the same key
-// WithTokenValidation uses, so GetTokenInfo can retrieve it. Exposed so callers
-// and tests can stage a validated identity onto the request without re-running
-// the full validation middleware.
-func ContextWithTokenInfo(ctx context.Context, tokenInfo *tokens.TokenInfo) context.Context {
-	return context.WithValue(ctx, tokenInfoKey{}, tokenInfo)
-}
-
 // GetBearerToken returns the inbound bearer/cookie token string stored on the
 // request context by WithTokenValidation, or "" if none.
 func GetBearerToken(r *http.Request) string {
@@ -434,3 +426,11 @@ func GetBearerToken(r *http.Request) string {
 
 type tokenInfoKey struct{}
 type bearerTokenKey struct{}
+
+// ContextWithTokenInfo stages a validated token info on the context under the
+// same key WithTokenValidation uses. It exists ONLY to let tests in other
+// packages drive handlers that read GetTokenInfo without standing up the full
+// validation middleware. Do not call it from production code.
+func ContextWithTokenInfo(ctx context.Context, ti *tokens.TokenInfo) context.Context {
+	return context.WithValue(ctx, tokenInfoKey{}, ti)
+}

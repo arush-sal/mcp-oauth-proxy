@@ -74,6 +74,77 @@ func TestWriteBearerChallenge_PathCannotBreakOutOfResourceMetadata(t *testing.T)
 	assert.NotContains(t, got, "\n")
 }
 
+func TestWriteBearerChallenge_HostCannotBreakOutOfResourceMetadata(t *testing.T) {
+	// GetBaseURL falls back to r.Host, which is the client-supplied HTTP Host
+	// header. Unlike the request path, r.Host is NOT percent-encoded by
+	// EscapedPath, so a malicious Host carrying a LITERAL double quote (and
+	// backslash) flows raw into resource_metadata. Only sanitizeHeaderQuotedValue
+	// stands between that raw '"' and a forged auth-param. This is the realistic
+	// literal-quote vector that %22-in-path cannot exercise.
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/mcp", nil)
+	// Trust-forwarded is the default (no context set) and no X-Mcp-Oauth-Proxy-URL
+	// header, so GetBaseURL derives the host from r.Host below.
+	req.Host = `ev\il"x, error="injected`
+
+	rec := httptest.NewRecorder()
+	WriteBearerChallenge(rec, req, "Token expired")
+
+	got := rec.Header().Get("WWW-Authenticate")
+
+	// The raw Host string must not appear verbatim: the literal '"' from Host must
+	// be backslash-escaped so it cannot close the resource_metadata quoted-string.
+	assert.NotContains(t, got, `ev\il"x, error="injected`,
+		"raw Host with a literal quote must not appear unescaped in the header")
+	assert.Contains(t, got, `ev\\il\"x, error=\"injected`,
+		"the literal backslash and quotes from Host must be backslash-escaped")
+	// No forged top-level auth-param could be created from the Host injection.
+	assert.NotContains(t, got, `, error="injected"`)
+
+	// Still exactly one well-formed Bearer challenge with the three expected
+	// params, in order, and nothing else: parse the unescaped quoted-strings out.
+	assert.True(t, strings.HasPrefix(got, `Bearer error="invalid_token", error_description="Token expired", resource_metadata="`), got)
+	assert.True(t, strings.HasSuffix(got, `"`), got)
+	assert.Equal(t, 6, countUnescapedParamQuotes(got),
+		"header must contain exactly three quoted auth-params (six delimiter quotes, no forged extras)")
+
+	// No header injection.
+	assert.NotContains(t, got, "\r")
+	assert.NotContains(t, got, "\n")
+}
+
+// countUnescapedParamQuotes counts the double quotes that actually delimit
+// quoted-string values, i.e. quotes NOT preceded by a backslash. A well-formed
+// challenge with three params has exactly six such quotes.
+func countUnescapedParamQuotes(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] != '"' {
+			continue
+		}
+		// Count preceding backslashes; an even count means the quote is a real
+		// (unescaped) delimiter.
+		bs := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			bs++
+		}
+		if bs%2 == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func TestSanitizeHeaderQuotedValue(t *testing.T) {
+	// Direct in-package unit test: a raw quote and backslash are escaped, and an
+	// ASCII control char is stripped, so the result is safe to embed in a
+	// double-quoted RFC 7235 auth-param value.
+	got := sanitizeHeaderQuotedValue("a\"b\\c\r\nd\x00e")
+	assert.Equal(t, `a\"b\\cde`, got)
+	assert.NotContains(t, got, "\r")
+	assert.NotContains(t, got, "\n")
+	assert.NotContains(t, got, "\x00")
+}
+
 func TestWriteBearerChallenge_StripsControlChars(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/mcp", nil)
 	rec := httptest.NewRecorder()
