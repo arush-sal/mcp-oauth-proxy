@@ -16,6 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// defaultSession returns the default resolved session config (defaults
+// reproduce the historical 1h access / 720h refresh behavior).
+func defaultSession() types.SessionConfig {
+	sc, err := types.ResolveSessionConfig(&types.Config{})
+	if err != nil {
+		panic(err)
+	}
+	return sc
+}
+
 // fakeStore is an in-memory token.TokenStore for refresh_token grant tests.
 type fakeStore struct {
 	client *types.ClientInfo
@@ -114,6 +124,78 @@ func baseStore(t *testing.T, claims idtoken.Claims) *fakeStore {
 	}
 }
 
+func newAuthCodeRequest(code, clientID string) *http.Request {
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("client_id", clientID)
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req
+}
+
+// authCodeStore returns a fakeStore whose grant is usable for the
+// authorization_code grant (ValidateAuthCode returns its grantID/userID and the
+// grant's ClientID matches "client").
+func authCodeStore(t *testing.T) *fakeStore {
+	t.Helper()
+	s := &fakeStore{
+		client: &types.ClientInfo{ClientID: "client", TokenEndpointAuthMethod: "none"},
+		grant: &types.Grant{
+			ID:       "grant-1",
+			UserID:   "user-1",
+			ClientID: "client",
+			// PKCE is enabled so redirect_uri is not required (OAuth 2.1). No
+			// code_verifier is sent, so the verifier check is skipped.
+			CodeChallenge:       "challenge",
+			CodeChallengeMethod: "S256",
+		},
+	}
+	return s
+}
+
+// TestAuthorizationCodeGrant_RefreshTokenExpiresAtHonorsCustomConfig is the
+// regression guard for the BLOCKER: handleAuthorizationCodeGrant must set the
+// stored TokenData.RefreshTokenExpiresAt from the session RefreshTTL. Before the
+// fix it left RefreshTokenExpiresAt zero, so db.StoreToken applied a hardcoded
+// 30-day (720h) fallback and a custom COOKIE_REFRESH was silently ignored. A
+// non-720h custom value (240h) exposes the bug: red asserts ~720h, green ~240h.
+func TestAuthorizationCodeGrant_RefreshTokenExpiresAtHonorsCustomConfig(t *testing.T) {
+	store := authCodeStore(t)
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	session, err := types.ResolveSessionConfig(&types.Config{CookieRefresh: "240h"})
+	require.NoError(t, err)
+
+	h := NewHandler(store, a, make([]byte, 32), session)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newAuthCodeRequest("the-code", "client"))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotEmpty(t, store.stored)
+	tok := store.stored[len(store.stored)-1]
+	assert.InDelta(t, (240 * time.Hour).Seconds(), time.Until(tok.RefreshTokenExpiresAt).Seconds(), 30,
+		"auth-code grant must persist RefreshTokenExpiresAt from the custom RefreshTTL, not the 720h fallback")
+}
+
+// TestAuthorizationCodeGrant_RefreshTokenExpiresAtDefault proves the default
+// session reproduces the historical ~720h refresh expiry on the auth-code grant.
+func TestAuthorizationCodeGrant_RefreshTokenExpiresAtDefault(t *testing.T) {
+	store := authCodeStore(t)
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	h := NewHandler(store, a, make([]byte, 32), defaultSession())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newAuthCodeRequest("the-code", "client"))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotEmpty(t, store.stored)
+	tok := store.stored[len(store.stored)-1]
+	assert.InDelta(t, (720 * time.Hour).Seconds(), time.Until(tok.RefreshTokenExpiresAt).Seconds(), 30)
+}
+
 // TestReauthorizeGrant_NilGrantIsInfraError proves the defensive nil-grant guard
 // (LOW-RISK C): a nil grant must not panic and must be an infra error (NOT
 // ErrDenied) so the caller preserves the session (CONCERN 2).
@@ -135,7 +217,7 @@ func TestRefreshTokenGrant_DeniesAndRevokesSession(t *testing.T) {
 	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}}) // no longer matches
 	require.NoError(t, err)
 
-	h := NewHandler(store, a, make([]byte, 32))
+	h := NewHandler(store, a, make([]byte, 32), defaultSession())
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newRefreshRequest("old-refresh", "client"))
 
@@ -153,7 +235,7 @@ func TestRefreshTokenGrant_DeniesAndRevokesSession(t *testing.T) {
 func TestRefreshTokenGrant_NilAuthorizerDenies(t *testing.T) {
 	store := baseStore(t, idtoken.Claims{Email: "user@example.com", EmailVerified: true})
 
-	h := NewHandler(store, nil, make([]byte, 32))
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newRefreshRequest("old-refresh", "client"))
 
@@ -169,7 +251,7 @@ func TestRefreshTokenGrant_RotatesAndRevokesOldToken(t *testing.T) {
 	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
 	require.NoError(t, err)
 
-	h := NewHandler(store, a, make([]byte, 32))
+	h := NewHandler(store, a, make([]byte, 32), defaultSession())
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newRefreshRequest("old-refresh", "client"))
 
@@ -193,4 +275,52 @@ func TestRefreshTokenGrant_RotatesAndRevokesOldToken(t *testing.T) {
 	rec3 := httptest.NewRecorder()
 	h.ServeHTTP(rec3, newRefreshRequest(resp.RefreshToken, "client"))
 	assert.Equal(t, http.StatusOK, rec3.Code, "new refresh token must be usable")
+}
+
+// TestRefreshTokenGrant_TTLDefaultsReproduceLegacy proves the refresh_token
+// grant issues a token whose ExpiresIn and DB expiries match the historical
+// 3600 / 2592000 defaults.
+func TestRefreshTokenGrant_TTLDefaultsReproduceLegacy(t *testing.T) {
+	store := baseStore(t, idtoken.Claims{Email: "user@example.com", EmailVerified: true})
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	h := NewHandler(store, a, make([]byte, 32), defaultSession())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newRefreshRequest("old-refresh", "client"))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp types.TokenResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, 3600, resp.ExpiresIn, "ExpiresIn = default AccessTTL seconds")
+
+	require.NotEmpty(t, store.stored)
+	newTok := store.stored[len(store.stored)-1]
+	assert.InDelta(t, time.Hour.Seconds(), time.Until(newTok.ExpiresAt).Seconds(), 30)
+	assert.InDelta(t, (720 * time.Hour).Seconds(), time.Until(newTok.RefreshTokenExpiresAt).Seconds(), 30)
+}
+
+// TestRefreshTokenGrant_TTLHonorsCustomConfig proves a custom session config is
+// reflected in ExpiresIn and both DB expiries.
+func TestRefreshTokenGrant_TTLHonorsCustomConfig(t *testing.T) {
+	store := baseStore(t, idtoken.Claims{Email: "user@example.com", EmailVerified: true})
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	session, err := types.ResolveSessionConfig(&types.Config{CookieExpire: "45m", CookieRefresh: "10h"})
+	require.NoError(t, err)
+
+	h := NewHandler(store, a, make([]byte, 32), session)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newRefreshRequest("old-refresh", "client"))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp types.TokenResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, int((45 * time.Minute).Seconds()), resp.ExpiresIn)
+
+	require.NotEmpty(t, store.stored)
+	newTok := store.stored[len(store.stored)-1]
+	assert.InDelta(t, (45 * time.Minute).Seconds(), time.Until(newTok.ExpiresAt).Seconds(), 30)
+	assert.InDelta(t, (10 * time.Hour).Seconds(), time.Until(newTok.RefreshTokenExpiresAt).Seconds(), 30)
 }

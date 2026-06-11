@@ -23,6 +23,7 @@ import (
 type fakeStore struct {
 	authRequest map[string]any
 	storedGrant *types.Grant
+	storedToken *types.TokenData
 }
 
 func (s *fakeStore) StoreGrant(grant *types.Grant) error {
@@ -33,8 +34,11 @@ func (s *fakeStore) StoreAuthCode(string, string, string) error { return nil }
 func (s *fakeStore) GetAuthRequest(string) (map[string]any, error) {
 	return s.authRequest, nil
 }
-func (s *fakeStore) DeleteAuthRequest(string) error    { return nil }
-func (s *fakeStore) StoreToken(*types.TokenData) error { return nil }
+func (s *fakeStore) DeleteAuthRequest(string) error { return nil }
+func (s *fakeStore) StoreToken(td *types.TokenData) error {
+	s.storedToken = td
+	return nil
+}
 
 // fakeProvider returns a fixed token from ExchangeCodeForToken.
 type fakeProvider struct {
@@ -82,6 +86,16 @@ func allowAny(t *testing.T) *authz.Authorizer {
 	return a
 }
 
+// defaultSession returns the default resolved session config (defaults
+// reproduce the historical 1h access / 720h refresh, auto Secure, Lax SameSite).
+func defaultSession() types.SessionConfig {
+	sc, err := types.ResolveSessionConfig(&types.Config{})
+	if err != nil {
+		panic(err)
+	}
+	return sc
+}
+
 func newCallbackRequest(t *testing.T) (*httptest.ResponseRecorder, *http.Request) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/callback?code=abc&state=xyz", nil)
@@ -107,7 +121,7 @@ func TestCallback_StoresVerifiedIDTokenClaims(t *testing.T) {
 		Groups:  []string{"admins"},
 	}}
 
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t))
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t), defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -131,7 +145,7 @@ func TestCallback_NoIDTokenLeavesPropsUnchanged(t *testing.T) {
 	provider := &fakeProvider{token: token}
 	verifier := &stubVerifier{claims: &idtoken.Claims{Email: "should-not-be-used@example.com"}}
 
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t))
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t), defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -151,7 +165,7 @@ func TestCallback_NoVerifierConfigured(t *testing.T) {
 	provider := &fakeProvider{token: token}
 
 	// nil verifier => non-OIDC setup, id_token ignored.
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t))
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -169,7 +183,7 @@ func TestCallback_InvalidIDTokenRejected(t *testing.T) {
 	provider := &fakeProvider{token: token}
 	verifier := &stubVerifier{err: errors.New("bad signature")}
 
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t))
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t), defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -197,7 +211,7 @@ func TestCallback_AllowedIdentityCreatesGrant(t *testing.T) {
 	}}
 
 	a := newAuthorizer(t, authz.Config{EmailDomains: []string{"example.com"}})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -218,7 +232,7 @@ func TestCallback_DeniedIdentityForbiddenNoGrant(t *testing.T) {
 	}}
 
 	a := newAuthorizer(t, authz.Config{EmailDomains: []string{"example.com"}})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -244,7 +258,7 @@ func TestCallback_DenyAllByDefault(t *testing.T) {
 	}}
 
 	a := newAuthorizer(t, authz.Config{})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -271,7 +285,7 @@ func TestCallback_UserInfoFallbackForEmail(t *testing.T) {
 	verifier := &stubVerifier{claims: &idtoken.Claims{Subject: "user-123"}}
 
 	a := newAuthorizer(t, authz.Config{EmailDomains: []string{"example.com"}})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -298,7 +312,7 @@ func TestCallback_StoresEmailVerifiedFromUserInfo(t *testing.T) {
 	verifier := &stubVerifier{claims: &idtoken.Claims{Subject: "user-123"}}
 
 	// Allow-any so the grant is created regardless of verified state.
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t))
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t), defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -326,7 +340,7 @@ func TestCallback_StoresVerifiedEmailFromUserInfo(t *testing.T) {
 	verifier := &stubVerifier{claims: &idtoken.Claims{Subject: "user-123"}}
 
 	a := newAuthorizer(t, authz.Config{EmailDomains: []string{"example.com"}})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -366,7 +380,7 @@ func TestCallback_StoredEmailAndVerifiedAreSelfConsistent(t *testing.T) {
 	// also fetch userinfo because NeedsEmail() is true and the id_token does
 	// supply an email, but the proxy still stores userinfo when scope asks for it.
 	a := newAuthorizer(t, authz.Config{EmailDomains: []string{"a.example.com"}})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
@@ -398,11 +412,141 @@ func TestCallback_MissingAttributeFailsClosed(t *testing.T) {
 	verifier := &stubVerifier{claims: &idtoken.Claims{Subject: "user-123"}}
 
 	a := newAuthorizer(t, authz.Config{Groups: []string{"admins"}})
-	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, a, defaultSession())
 
 	rec, req := newCallbackRequest(t)
 	h.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 	assert.Nil(t, store.storedGrant)
+}
+
+// uiCallbackRequest builds a callback request whose stored auth-request carries
+// an "rd" (relative redirect), triggering the UI cookie-setting flow.
+func uiCallbackRequest(t *testing.T, secureScheme bool) (*httptest.ResponseRecorder, *http.Request, *fakeStore) {
+	t.Helper()
+	store := &fakeStore{authRequest: map[string]any{
+		"client_id": "client",
+		"scope":     "openid",
+		"rd":        "/dashboard",
+	}}
+	rec := httptest.NewRecorder()
+	scheme := "https"
+	if !secureScheme {
+		scheme = "http"
+	}
+	req := httptest.NewRequest(http.MethodGet, scheme+"://proxy.example.com/callback?code=abc&state=xyz", nil)
+	if !secureScheme {
+		// httptest.NewRequest sets TLS for https URLs; clear it for the plain case.
+		req.TLS = nil
+	}
+	return rec, req, store
+}
+
+func findCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+func TestCallback_CookieAttributesHonored(t *testing.T) {
+	provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+
+	// Custom session: 30m access, 2h refresh, force Secure, SameSite=Strict.
+	session, err := types.ResolveSessionConfig(&types.Config{
+		CookieExpire:   "30m",
+		CookieRefresh:  "2h",
+		CookieSecure:   "true",
+		CookieSameSite: "strict",
+	})
+	require.NoError(t, err)
+
+	rec, req, store := uiCallbackRequest(t, false) // plain HTTP, but Secure forced
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), session)
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	cookies := rec.Result().Cookies()
+
+	access := findCookie(cookies, types.AccessTokenCookieName)
+	require.NotNil(t, access, "access cookie must be set")
+	assert.Equal(t, 1800, access.MaxAge, "access cookie MaxAge = AccessTTL seconds")
+	assert.True(t, access.Secure, "Secure forced even on plain HTTP")
+	assert.Equal(t, http.SameSiteStrictMode, access.SameSite)
+
+	refresh := findCookie(cookies, types.RefreshTokenCookieName)
+	require.NotNil(t, refresh, "refresh cookie must be set")
+	assert.Equal(t, 7200, refresh.MaxAge, "refresh cookie MaxAge = RefreshTTL seconds")
+	assert.True(t, refresh.Secure)
+	assert.Equal(t, http.SameSiteStrictMode, refresh.SameSite)
+}
+
+func TestCallback_CookieDefaultsReproduceLegacy(t *testing.T) {
+	provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+
+	// Plain HTTP with auto Secure => not Secure (legacy isSecureRequest behavior).
+	rec, req, store := uiCallbackRequest(t, false)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	cookies := rec.Result().Cookies()
+
+	access := findCookie(cookies, types.AccessTokenCookieName)
+	require.NotNil(t, access)
+	assert.Equal(t, 3600, access.MaxAge, "legacy access cookie MaxAge = 3600")
+	assert.False(t, access.Secure, "auto Secure off on plain HTTP")
+	assert.Equal(t, http.SameSiteLaxMode, access.SameSite)
+
+	refresh := findCookie(cookies, types.RefreshTokenCookieName)
+	require.NotNil(t, refresh)
+	assert.Equal(t, 30*24*3600, refresh.MaxAge, "legacy refresh cookie MaxAge = 2592000")
+	assert.False(t, refresh.Secure)
+	assert.Equal(t, http.SameSiteLaxMode, refresh.SameSite)
+
+	// Token DB expiries and grant expiry reflect the defaults.
+	require.NotNil(t, store.storedToken)
+	accessTTL := time.Until(store.storedToken.ExpiresAt)
+	assert.InDelta(t, time.Hour.Seconds(), accessTTL.Seconds(), 60, "access token DB expiry ~1h")
+	refreshTTL := time.Until(store.storedToken.RefreshTokenExpiresAt)
+	assert.InDelta(t, (720 * time.Hour).Seconds(), refreshTTL.Seconds(), 60, "refresh token DB expiry ~720h")
+
+	require.NotNil(t, store.storedGrant)
+	grantTTL := store.storedGrant.ExpiresAt - store.storedGrant.CreatedAt
+	assert.Equal(t, int64(2592000), grantTTL, "grant expiry mirrors refresh (2592000s)")
+}
+
+func TestCallback_CookieSecureAutoOnHTTPS(t *testing.T) {
+	provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+
+	rec, req, store := uiCallbackRequest(t, true) // HTTPS request
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
+	require.NotNil(t, access)
+	assert.True(t, access.Secure, "auto Secure on HTTPS request")
+}
+
+func TestCallback_TokenDBExpiryReflectsCustomConfig(t *testing.T) {
+	provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+
+	session, err := types.ResolveSessionConfig(&types.Config{CookieExpire: "15m", CookieRefresh: "48h"})
+	require.NoError(t, err)
+
+	rec, req, store := uiCallbackRequest(t, true)
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), session)
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	require.NotNil(t, store.storedToken)
+	assert.InDelta(t, (15 * time.Minute).Seconds(), time.Until(store.storedToken.ExpiresAt).Seconds(), 30)
+	assert.InDelta(t, (48 * time.Hour).Seconds(), time.Until(store.storedToken.RefreshTokenExpiresAt).Seconds(), 30)
+
+	require.NotNil(t, store.storedGrant)
+	assert.Equal(t, int64((48 * time.Hour).Seconds()), store.storedGrant.ExpiresAt-store.storedGrant.CreatedAt)
 }

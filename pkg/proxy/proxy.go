@@ -49,6 +49,7 @@ type OAuthProxy struct {
 	authorizer      *authz.Authorizer
 	idTokenVerifier callback.IDTokenVerifier
 	forwardCfg      forwardConfig
+	sessionCfg      types.SessionConfig
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -160,6 +161,13 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		return nil, fmt.Errorf("invalid token forwarding configuration: %w", err)
 	}
 
+	// Resolve and validate the session/cookie lifetime + security policy (F5)
+	// once at startup. Defaults reproduce the historical hardcoded behavior.
+	sessionCfg, err := types.ResolveSessionConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("invalid session/cookie configuration: %w", err)
+	}
+
 	// Split and trim scopes to handle whitespace
 	scopesSupported := ParseScopesSupported(config.ScopesSupported)
 
@@ -192,6 +200,7 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		config:        config,
 		authorizer:    authorizer,
 		forwardCfg:    forwardCfg,
+		sessionCfg:    sessionCfg,
 		ctx:           ctx,
 		cancel:        cancel,
 	}, nil
@@ -340,10 +349,10 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	p.idTokenVerifier = idTokenVerifier
 
 	authorizeHandler := authorize.NewHandler(p.db, provider, p.metadata.ScopesSupported, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix)
-	tokenHandler := token.NewHandler(p.db, p.authorizer, p.encryptionKey)
-	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, idTokenVerifier, p.authorizer)
+	tokenHandler := token.NewHandler(p.db, p.authorizer, p.encryptionKey, p.sessionCfg)
+	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, idTokenVerifier, p.authorizer, p.sessionCfg)
 	revokeHandler := revoke.NewHandler(p.db)
-	tokenValidator := validate.NewTokenValidator(p.tokenManager, p.encryptionKey, p.db, provider, p.config.RoutePrefix, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.CookieNamePrefix, p.config.MCPServerID, p.metadata.ScopesSupported, p.config.MCPPaths, p.authorizer, idTokenVerifier)
+	tokenValidator := validate.NewTokenValidator(p.tokenManager, p.encryptionKey, p.db, provider, p.config.RoutePrefix, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.CookieNamePrefix, p.config.MCPServerID, p.metadata.ScopesSupported, p.config.MCPPaths, p.authorizer, idTokenVerifier, p.sessionCfg)
 	successHandler := success.NewHandler()
 
 	// Get route prefix from config

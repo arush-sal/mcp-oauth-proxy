@@ -49,6 +49,8 @@ type Handler struct {
 	// authorizer enforces the allowlist (who may use the proxy). It is always
 	// non-nil; a zero-config authorizer denies everyone (fail-closed default).
 	authorizer *authz.Authorizer
+	// session carries the resolved cookie/session lifetime and security policy.
+	session types.SessionConfig
 }
 
 // MCPUIManager interface for generating JWT tokens
@@ -56,7 +58,7 @@ type MCPUIManager interface {
 	GenerateMCPUICodeForDownstream(bearerToken, refreshToken string) (string, error)
 }
 
-func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier, authorizer *authz.Authorizer) http.Handler {
+func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier, authorizer *authz.Authorizer, session types.SessionConfig) http.Handler {
 	return &Handler{
 		db:               db,
 		provider:         provider,
@@ -67,6 +69,7 @@ func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, cli
 		cookieNamePrefix: cookieNamePrefix,
 		idTokenVerifier:  idTokenVerifier,
 		authorizer:       authorizer,
+		session:          session,
 	}
 }
 
@@ -120,11 +123,6 @@ func getStringFromMap(data map[string]any, key string) string {
 	return ""
 }
 
-// isSecureRequest determines if the request is over HTTPS
-func isSecureRequest(r *http.Request) bool {
-	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
-}
-
 // setEncryptedCookie sets an encrypted cookie with security attributes
 func (p *Handler) setEncryptedCookie(w http.ResponseWriter, r *http.Request, name, value string, maxAge int) error {
 	encryptedValue, err := encryption.EncryptCookie(p.encryptionKey, value)
@@ -138,8 +136,8 @@ func (p *Handler) setEncryptedCookie(w http.ResponseWriter, r *http.Request, nam
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   isSecureRequest(r),
-		SameSite: http.SameSiteLaxMode,
+		Secure:   p.session.SecureForRequest(r),
+		SameSite: p.session.SameSite,
 	}
 
 	http.SetCookie(w, cookie)
@@ -366,7 +364,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		Props:               props,
 		CreatedAt:           now,
-		ExpiresAt:           now + 3600*24*30, // 30 days to expire for grant, same as refresh token
+		ExpiresAt:           now + int64(p.session.RefreshTTL.Seconds()), // grant expiry mirrors the refresh token lifetime
 		CodeChallenge:       authReq.CodeChallenge,
 		CodeChallengeMethod: authReq.CodeChallengeMethod,
 	}
@@ -422,8 +420,8 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			UserID:                userInfo.ID,
 			GrantID:               grantID,
 			Scope:                 authReq.Scope,
-			ExpiresAt:             time.Now().Add(time.Hour),           // 1 hour for access token
-			RefreshTokenExpiresAt: time.Now().Add(30 * 24 * time.Hour), // 30 days for refresh token
+			ExpiresAt:             time.Now().Add(p.session.AccessTTL),  // access token lifetime
+			RefreshTokenExpiresAt: time.Now().Add(p.session.RefreshTTL), // refresh token lifetime
 			CreatedAt:             time.Now(),
 			Revoked:               false,
 		}
@@ -440,8 +438,8 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		accessCookieName := p.cookieNamePrefix + types.AccessTokenCookieName
 		refreshCookieName := p.cookieNamePrefix + types.RefreshTokenCookieName
 
-		// Access token cookie (1 hour)
-		if err := p.setEncryptedCookie(w, r, accessCookieName, accessToken, 3600); err != nil {
+		// Access token cookie
+		if err := p.setEncryptedCookie(w, r, accessCookieName, accessToken, p.session.AccessTTLSeconds()); err != nil {
 			log.Printf("Failed to set access token cookie: %v", err)
 			handlerutils.JSON(w, http.StatusInternalServerError, types.OAuthError{
 				Error:            "server_error",
@@ -450,8 +448,8 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Refresh token cookie (30 days)
-		if err := p.setEncryptedCookie(w, r, refreshCookieName, refreshToken, 30*24*3600); err != nil {
+		// Refresh token cookie
+		if err := p.setEncryptedCookie(w, r, refreshCookieName, refreshToken, p.session.RefreshTTLSeconds()); err != nil {
 			log.Printf("Failed to set refresh token cookie: %v", err)
 			handlerutils.JSON(w, http.StatusInternalServerError, types.OAuthError{
 				Error:            "server_error",

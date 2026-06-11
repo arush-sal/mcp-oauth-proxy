@@ -141,12 +141,43 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `ALLOWED_GOOGLE_HOSTED_DOMAINS` | ❌ | Comma-separated allowed Google hosted domains (`hd` claim)  |
 | `AUTHORIZATION_HEADER_TOKEN` | ❌ | Token to forward on the upstream `Authorization` header: `none` (default), `access_token`, or `id_token`. See "Forwarding the ID token to the upstream" |
 | `ID_TOKEN_HEADER`           | ❌ | Custom header to carry the raw verified id_token (no `Bearer ` prefix). When empty and forwarding the id_token, uses `Authorization: Bearer <id_token>` |
+| `COOKIE_EXPIRE`             | ❌ | Access-token / access-cookie lifetime as a Go duration string (e.g. `30m`, `1h`, `2h`). Default `1h`. Must be positive. See "Session & cookie lifetime" |
+| `COOKIE_REFRESH`            | ❌ | Refresh-token / refresh-cookie lifetime **and** grant expiry, as a Go duration string (e.g. `720h`). Default `720h` (30 days). Must be positive |
+| `COOKIE_SECURE`             | ❌ | Cookie `Secure` attribute policy: `auto` (default; Secure when the request is HTTPS), `true` (always), or `false` (never) |
+| `COOKIE_SAMESITE`           | ❌ | Cookie `SameSite` attribute: `lax` (default), `strict`, or `none`. `none` requires `COOKIE_SECURE=true` |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
 
 ```bash
 openssl rand -base64 32
 ```
+
+### Session & cookie lifetime
+
+The session/cookie lifetimes and cookie security attributes are configurable.
+**The defaults reproduce the previous behavior exactly**, so existing deployments
+need no changes.
+
+- `COOKIE_EXPIRE` (default `1h`) sets the access-token lifetime, the access
+  cookie `Max-Age`, and the `expires_in` value in token responses.
+- `COOKIE_REFRESH` (default `720h`, i.e. 30 days) sets the refresh-token
+  lifetime, the refresh cookie `Max-Age`, and the authorization grant expiry
+  (which mirrors the refresh token, as before).
+- Both accept a Go duration string parsed with
+  [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) (e.g. `30m`,
+  `90m`, `2h`, `720h`). Values must be strictly positive; a non-positive or
+  unparseable value is rejected at startup.
+- `COOKIE_SECURE` controls the cookie `Secure` attribute: `auto` (default) sets
+  `Secure` only when the request is detected as HTTPS (preserving the prior
+  behavior), `true` always sets it, and `false` never sets it.
+- `COOKIE_SAMESITE` controls the cookie `SameSite` attribute: `lax` (default),
+  `strict`, or `none`.
+
+> [!NOTE]
+> `COOKIE_SAMESITE=none` requires `COOKIE_SECURE=true`. Browsers reject
+> `SameSite=None` cookies that are not also `Secure`, so this combination is
+> rejected at startup with a clear error. (`auto` is not sufficient because it
+> cannot guarantee the cookie is always marked `Secure`.)
 
 ## Authorization / Allowlist
 

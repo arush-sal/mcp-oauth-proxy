@@ -57,6 +57,22 @@ type Config struct {
 	// active, the id_token is sent as "Authorization: Bearer <id_token>".
 	AuthorizationHeaderToken string
 	IDTokenHeader            string
+
+	// Session & cookie lifetime / security (F5). These are RAW, unparsed
+	// strings resolved once at startup by ResolveSessionConfig into a
+	// SessionConfig. Empty values fall back to defaults that reproduce the
+	// historical hardcoded behavior exactly.
+	//
+	// CookieExpire is the access-token / access-cookie lifetime (Go duration
+	// string, default "1h"). CookieRefresh is the refresh-token / refresh-cookie
+	// lifetime AND the grant expiry (Go duration string, default "720h").
+	// CookieSecure is tri-state: "auto" (default), "true", "false". CookieSameSite
+	// is one of "lax" (default), "strict", "none"; "none" requires CookieSecure
+	// "true".
+	CookieExpire   string
+	CookieRefresh  string
+	CookieSecure   string
+	CookieSameSite string
 }
 
 // TokenData represents stored token data for OAuth 2.1 compliance

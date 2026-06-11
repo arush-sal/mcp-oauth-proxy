@@ -24,6 +24,7 @@ type fakeTokenStore struct {
 	revokedGrants []string
 	grantErr      error
 	refreshData   *types.TokenData
+	stored        []*types.TokenData
 }
 
 func (s *fakeTokenStore) GetToken(string) (*types.TokenData, error) { return nil, nil }
@@ -33,7 +34,10 @@ func (s *fakeTokenStore) GetTokenByRefreshToken(string) (*types.TokenData, error
 	}
 	return nil, nil
 }
-func (s *fakeTokenStore) StoreToken(*types.TokenData) error             { return nil }
+func (s *fakeTokenStore) StoreToken(td *types.TokenData) error {
+	s.stored = append(s.stored, td)
+	return nil
+}
 func (s *fakeTokenStore) StoreAuthRequest(string, map[string]any) error { return nil }
 func (s *fakeTokenStore) RevokeToken(token string) error {
 	s.revoked = append(s.revoked, token)
@@ -180,6 +184,11 @@ func (d *fakeTokenDatabase) GetGrant(string, string) (*types.Grant, error) {
 // p.db drives refreshAccessToken.
 func newCookieValidator(t *testing.T, store TokenStore, a *authz.Authorizer, tokenData *types.TokenData, grant *types.Grant) *TokenValidator {
 	t.Helper()
+	return newCookieValidatorWithSession(t, store, a, tokenData, grant, defaultSession(t))
+}
+
+func newCookieValidatorWithSession(t *testing.T, store TokenStore, a *authz.Authorizer, tokenData *types.TokenData, grant *types.Grant, session types.SessionConfig) *TokenValidator {
+	t.Helper()
 	tm, err := tokens.NewTokenManager(&fakeTokenDatabase{tokenData: tokenData, grant: grant})
 	require.NoError(t, err)
 	return &TokenValidator{
@@ -189,7 +198,16 @@ func newCookieValidator(t *testing.T, store TokenStore, a *authz.Authorizer, tok
 		authorizer:             a,
 		accessTokenCookieName:  "access_token",
 		refreshTokenCookieName: "refresh_token",
+		session:                session,
 	}
+}
+
+// defaultSession returns the default resolved session config.
+func defaultSession(t *testing.T) types.SessionConfig {
+	t.Helper()
+	sc, err := types.ResolveSessionConfig(&types.Config{})
+	require.NoError(t, err)
+	return sc
 }
 
 func cookieRequest(t *testing.T, key []byte, accessToken, refreshToken string) *http.Request {
@@ -283,4 +301,124 @@ func TestWithTokenValidation_InfraRefreshErrorContinuesWithValidToken(t *testing
 	assert.True(t, called, "infra refresh error with a still-valid token must continue to the handler")
 	assert.NotEqual(t, http.StatusUnauthorized, rec.Code)
 	assert.Empty(t, store.revokedGrants, "an infra error must NOT revoke the session")
+}
+
+// TestRefreshCookieAttributesHonored drives the cookie refresh path and asserts
+// the rotated access/refresh cookies carry the configured MaxAge, Secure, and
+// SameSite, and that the new token DB row uses the configured TTLs.
+func TestRefreshCookieAttributesHonored(t *testing.T) {
+	key := make([]byte, 32)
+	const userID, grantID = "user-1", "grant-1"
+	accessToken := userID + ":" + grantID + ":access-secret"
+	refreshToken := userID + ":" + grantID + ":refresh-secret"
+
+	// Cookie token valid but within the 15-minute refresh window so refresh runs.
+	tokenData := &types.TokenData{
+		AccessToken:           accessToken,
+		RefreshToken:          refreshToken,
+		UserID:                userID,
+		GrantID:               grantID,
+		ExpiresAt:             time.Now().Add(5 * time.Minute),
+		RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	grant := grantWithClaims(t, idtoken.Claims{Email: "user@example.com", EmailVerified: true})
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	session, err := types.ResolveSessionConfig(&types.Config{
+		CookieExpire:   "30m",
+		CookieRefresh:  "2h",
+		CookieSecure:   "true",
+		CookieSameSite: "strict",
+	})
+	require.NoError(t, err)
+
+	store := &fakeTokenStore{grant: grant, refreshData: tokenData}
+	v := newCookieValidatorWithSession(t, store, a, tokenData, grant, session)
+
+	called := false
+	handler := v.WithTokenValidation(func(http.ResponseWriter, *http.Request) { called = true })
+
+	rec := httptest.NewRecorder()
+	// Plain HTTP request; Secure must still be true because COOKIE_SECURE=true.
+	req := cookieRequest(t, key, accessToken, refreshToken)
+	req.URL.Scheme = "http"
+	req.TLS = nil
+	req.Header.Del("X-Forwarded-Proto")
+	handler(rec, req)
+
+	require.True(t, called, "refresh should succeed and call the downstream handler")
+	cookies := rec.Result().Cookies()
+
+	access := findRespCookie(cookies, "access_token")
+	require.NotNil(t, access, "rotated access cookie must be set")
+	assert.Equal(t, 1800, access.MaxAge)
+	assert.True(t, access.Secure, "COOKIE_SECURE=true forces Secure even on plain HTTP")
+	assert.Equal(t, http.SameSiteStrictMode, access.SameSite)
+
+	refresh := findRespCookie(cookies, "refresh_token")
+	require.NotNil(t, refresh, "rotated refresh cookie must be set")
+	assert.Equal(t, 7200, refresh.MaxAge)
+	assert.True(t, refresh.Secure)
+	assert.Equal(t, http.SameSiteStrictMode, refresh.SameSite)
+
+	// The new token DB row reflects the configured TTLs.
+	require.NotEmpty(t, store.stored)
+	newTok := store.stored[len(store.stored)-1]
+	assert.InDelta(t, (30 * time.Minute).Seconds(), time.Until(newTok.ExpiresAt).Seconds(), 30)
+	assert.InDelta(t, (2 * time.Hour).Seconds(), time.Until(newTok.RefreshTokenExpiresAt).Seconds(), 30)
+}
+
+// TestRefreshCookieDefaultsReproduceLegacy confirms default config yields the
+// historical 3600 / 2592000 MaxAge, Lax SameSite, and auto Secure (off on HTTP).
+func TestRefreshCookieDefaultsReproduceLegacy(t *testing.T) {
+	key := make([]byte, 32)
+	const userID, grantID = "user-1", "grant-1"
+	accessToken := userID + ":" + grantID + ":access-secret"
+	refreshToken := userID + ":" + grantID + ":refresh-secret"
+
+	tokenData := &types.TokenData{
+		AccessToken:           accessToken,
+		RefreshToken:          refreshToken,
+		UserID:                userID,
+		GrantID:               grantID,
+		ExpiresAt:             time.Now().Add(5 * time.Minute),
+		RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	grant := grantWithClaims(t, idtoken.Claims{Email: "user@example.com", EmailVerified: true})
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	store := &fakeTokenStore{grant: grant, refreshData: tokenData}
+	v := newCookieValidator(t, store, a, tokenData, grant) // default session
+
+	handler := v.WithTokenValidation(func(http.ResponseWriter, *http.Request) {})
+	rec := httptest.NewRecorder()
+	req := cookieRequest(t, key, accessToken, refreshToken)
+	req.URL.Scheme = "http"
+	req.TLS = nil
+	req.Header.Del("X-Forwarded-Proto")
+	handler(rec, req)
+
+	cookies := rec.Result().Cookies()
+	access := findRespCookie(cookies, "access_token")
+	require.NotNil(t, access)
+	assert.Equal(t, 3600, access.MaxAge)
+	assert.False(t, access.Secure, "auto Secure off on plain HTTP (legacy)")
+	assert.Equal(t, http.SameSiteLaxMode, access.SameSite)
+
+	refresh := findRespCookie(cookies, "refresh_token")
+	require.NotNil(t, refresh)
+	assert.Equal(t, 30*24*3600, refresh.MaxAge)
+	assert.False(t, refresh.Secure)
+	assert.Equal(t, http.SameSiteLaxMode, refresh.SameSite)
+}
+
+func findRespCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, c := range cookies {
+		if c.Name == name {
+			return c
+		}
+	}
+	return nil
 }

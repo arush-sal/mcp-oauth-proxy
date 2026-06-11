@@ -35,6 +35,7 @@ type TokenValidator struct {
 	mcpPaths               []string
 	authorizer             *authz.Authorizer // allowlist, re-checked on refresh
 	idTokenVerifier        IDTokenVerifier   // optional, to re-verify a fresh id_token on refresh
+	session                types.SessionConfig
 }
 
 // IDTokenVerifier verifies an IdP-issued id_token and returns its normalized
@@ -55,7 +56,7 @@ type TokenStore interface {
 	GetGrant(grantID, userID string) (*types.Grant, error)
 }
 
-func NewTokenValidator(tokenManager *tokens.TokenManager, encryptionKey []byte, db TokenStore, provider providers.Provider, routePrefix, clientID, clientSecret, cookieNamePrefix, mcpServerID string, scopesSupported, mcpPaths []string, authorizer *authz.Authorizer, idTokenVerifier IDTokenVerifier) *TokenValidator {
+func NewTokenValidator(tokenManager *tokens.TokenManager, encryptionKey []byte, db TokenStore, provider providers.Provider, routePrefix, clientID, clientSecret, cookieNamePrefix, mcpServerID string, scopesSupported, mcpPaths []string, authorizer *authz.Authorizer, idTokenVerifier IDTokenVerifier, session types.SessionConfig) *TokenValidator {
 	return &TokenValidator{
 		tokenManager:           tokenManager,
 		encryptionKey:          encryptionKey,
@@ -71,6 +72,7 @@ func NewTokenValidator(tokenManager *tokens.TokenManager, encryptionKey []byte, 
 		mcpPaths:               mcpPaths,
 		authorizer:             authorizer,
 		idTokenVerifier:        idTokenVerifier,
+		session:                session,
 	}
 }
 
@@ -240,8 +242,8 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 		UserID:                tokenData.UserID,
 		GrantID:               tokenData.GrantID,
 		Scope:                 tokenData.Scope,
-		ExpiresAt:             time.Now().Add(time.Hour),           // 1 hour
-		RefreshTokenExpiresAt: time.Now().Add(30 * 24 * time.Hour), // 30 days
+		ExpiresAt:             time.Now().Add(p.session.AccessTTL),  // access token lifetime
+		RefreshTokenExpiresAt: time.Now().Add(p.session.RefreshTTL), // refresh token lifetime
 		CreatedAt:             time.Now(),
 		Revoked:               false,
 	}
@@ -251,9 +253,9 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Determine if request is secure for cookie Secure flag
-	isSecure := r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+	isSecure := p.session.SecureForRequest(r)
 
-	// Encrypt and set access token cookie (1 hour = 3600 seconds)
+	// Encrypt and set access token cookie
 	encryptedAccessToken, err := encryption.EncryptCookie(p.encryptionKey, newAccessToken)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt access token: %w", err)
@@ -263,13 +265,13 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 		Name:     p.accessTokenCookieName,
 		Value:    encryptedAccessToken,
 		Path:     "/",
-		MaxAge:   3600,
+		MaxAge:   p.session.AccessTTLSeconds(),
 		HttpOnly: true,
 		Secure:   isSecure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: p.session.SameSite,
 	})
 
-	// Encrypt and set refresh token cookie (30 days = 2592000 seconds)
+	// Encrypt and set refresh token cookie
 	encryptedRefreshToken, err := encryption.EncryptCookie(p.encryptionKey, newRefreshToken)
 	if err != nil {
 		return "", fmt.Errorf("failed to encrypt refresh token: %w", err)
@@ -279,10 +281,10 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 		Name:     p.refreshTokenCookieName,
 		Value:    encryptedRefreshToken,
 		Path:     "/",
-		MaxAge:   30 * 24 * 3600,
+		MaxAge:   p.session.RefreshTTLSeconds(),
 		HttpOnly: true,
 		Secure:   isSecure,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: p.session.SameSite,
 	})
 
 	return newAccessToken, nil
