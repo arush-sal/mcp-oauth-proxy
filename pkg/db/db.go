@@ -295,6 +295,20 @@ func (d *Store) RevokeToken(token string) error {
 	return result.Error
 }
 
+// RevokeTokensByGrant revokes EVERY token (access and refresh, across all
+// rotations) that belongs to the given grant, killing the whole session rather
+// than a single token pair. It is used when authorization is revoked on refresh
+// so a browser/agent cannot continue with any surviving token for the grant. A
+// grant with no tokens is not an error.
+func (d *Store) RevokeTokensByGrant(grantID string) error {
+	now := time.Now()
+	result := d.db.Model(&types.TokenData{}).Where("grant_id = ?", grantID).Updates(map[string]any{
+		"revoked":    true,
+		"revoked_at": &now,
+	})
+	return result.Error
+}
+
 // CleanupExpiredTokens removes expired tokens and authorization codes
 func (d *Store) CleanupExpiredTokens() error {
 	now := time.Now()

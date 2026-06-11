@@ -28,6 +28,21 @@ type Config struct {
 	MCPPaths             []string
 	APIKeyAuthWebhookURL string
 	MCPServerID          string
+
+	// OAuthIssuerURL, when set, is the expected id_token "iss" value. It
+	// overrides the issuer derived from OAuthAuthorizeURL's origin, which is
+	// required for path-based issuers (e.g. Keycloak https://host/realms/x).
+	OAuthIssuerURL string
+
+	// Authorization / allowlist (oauth2-proxy parity). With NONE of these set,
+	// the proxy DENIES ALL authenticated users (fail-closed breaking-change
+	// default). See pkg/authz.
+	AllowedEmails              []string // explicit allowed email addresses
+	AllowedEmailsFile          string   // path to a file of allowed emails (one per line)
+	AllowedEmailDomains        []string // allowed email domains; "*" allows any authenticated user
+	AllowedGroups              []string // allowed groups (intersection with the user's groups)
+	GroupsClaim                string   // id_token claim carrying groups (default "groups")
+	AllowedGoogleHostedDomains []string // allowed Google hosted domains ("hd" claim)
 }
 
 // TokenData represents stored token data for OAuth 2.1 compliance

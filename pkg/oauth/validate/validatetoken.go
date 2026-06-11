@@ -4,14 +4,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/authz"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/idtoken"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/tokens"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
@@ -30,6 +33,15 @@ type TokenValidator struct {
 	mcpServerID            string
 	scopesSupported        []string // Supported OAuth scopes
 	mcpPaths               []string
+	authorizer             *authz.Authorizer // allowlist, re-checked on refresh
+	idTokenVerifier        IDTokenVerifier   // optional, to re-verify a fresh id_token on refresh
+}
+
+// IDTokenVerifier verifies an IdP-issued id_token and returns its normalized
+// claims. *idtoken.Verifier satisfies this; kept as an interface so it is
+// optional and the validator can be unit tested.
+type IDTokenVerifier interface {
+	Verify(ctx context.Context, rawIDToken string) (*idtoken.Claims, error)
 }
 
 // TokenStore interface for database operations needed by validator
@@ -38,10 +50,12 @@ type TokenStore interface {
 	GetTokenByRefreshToken(refreshToken string) (*types.TokenData, error)
 	StoreToken(token *types.TokenData) error
 	RevokeToken(token string) error
+	RevokeTokensByGrant(grantID string) error
 	StoreAuthRequest(key string, data map[string]any) error
+	GetGrant(grantID, userID string) (*types.Grant, error)
 }
 
-func NewTokenValidator(tokenManager *tokens.TokenManager, encryptionKey []byte, db TokenStore, provider providers.Provider, routePrefix, clientID, clientSecret, cookieNamePrefix, mcpServerID string, scopesSupported, mcpPaths []string) *TokenValidator {
+func NewTokenValidator(tokenManager *tokens.TokenManager, encryptionKey []byte, db TokenStore, provider providers.Provider, routePrefix, clientID, clientSecret, cookieNamePrefix, mcpServerID string, scopesSupported, mcpPaths []string, authorizer *authz.Authorizer, idTokenVerifier IDTokenVerifier) *TokenValidator {
 	return &TokenValidator{
 		tokenManager:           tokenManager,
 		encryptionKey:          encryptionKey,
@@ -55,6 +69,8 @@ func NewTokenValidator(tokenManager *tokens.TokenManager, encryptionKey []byte, 
 		mcpServerID:            mcpServerID,
 		scopesSupported:        scopesSupported,
 		mcpPaths:               mcpPaths,
+		authorizer:             authorizer,
+		idTokenVerifier:        idTokenVerifier,
 	}
 }
 
@@ -118,12 +134,23 @@ func (p *TokenValidator) WithTokenValidation(next http.HandlerFunc) http.Handler
 		if fromCookie && time.Until(tokenInfo.ExpiresAt) < 15*time.Minute {
 			newToken, refreshErr := p.refreshAccessToken(w, r)
 			if refreshErr != nil {
+				// Authorization was REVOKED during refresh: block the current
+				// request immediately, regardless of remaining token validity.
+				// refreshAccessToken has already revoked the whole session, so
+				// letting the in-flight request finish on the still-valid token
+				// would let a revoked user keep access for up to ~15 minutes.
+				if errors.Is(refreshErr, authz.ErrDenied) {
+					p.sendUnauthorizedResponse(w, r, "Authorization revoked")
+					return
+				}
 				// If token is already expired, refresh is required
 				if time.Now().After(tokenInfo.ExpiresAt) {
 					p.sendUnauthorizedResponse(w, r, "Token expired and refresh failed")
 					return
 				}
-				// Token not yet expired, log warning and continue with current token
+				// Non-deny (infra) error and token not yet expired: a transient
+				// blip must not block the request (CONCERN 2). Log and continue
+				// with the current token.
 				fmt.Printf("Token refresh failed but token still valid, continuing: %v\n", refreshErr)
 			} else {
 				// Refresh succeeded, use new token and get updated token info
@@ -177,6 +204,24 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 	// Check if token is revoked
 	if tokenData.Revoked {
 		return "", fmt.Errorf("refresh token has been revoked")
+	}
+
+	// Re-check the allowlist on every refresh (user decision: authorization is
+	// re-evaluated on each token refresh). This internal-token rotation does not
+	// contact the IdP, so we re-derive the identity from the stored grant claims.
+	// On an actual authorization DENY we revoke the whole session so the
+	// cookie/browser path is forced to re-authenticate. On an infrastructure
+	// error (grant load/decrypt failure) we fail closed for THIS request only and
+	// do NOT revoke the session, so a transient DB blip cannot permanently kill
+	// it. Either way we return an error (never a 500) that the caller maps to a
+	// 401 / re-auth flow.
+	if err := p.reauthorizeStoredGrant(tokenData.GrantID, tokenData.UserID); err != nil {
+		if errors.Is(err, authz.ErrDenied) {
+			p.revokeGrantTokens(refreshToken, tokenData)
+			return "", fmt.Errorf("authorization revoked on refresh: %w", err)
+		}
+		// Infrastructure error: deny this refresh but keep the session.
+		return "", fmt.Errorf("authorization re-check failed on refresh: %w", err)
 	}
 
 	// Generate new access token: userId:grantId:accessTokenSecret
@@ -241,6 +286,62 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 	})
 
 	return newAccessToken, nil
+}
+
+// reauthorizeStoredGrant re-derives the identity from the stored grant props and
+// runs it through the allowlist. It returns nil if allowed. It fails closed:
+//   - a nil authorizer returns authz.ErrDenied (deny, never allow) — CONCERN 1.
+//   - an actual allowlist deny returns authz.ErrDenied.
+//   - an infrastructure failure (grant load/decrypt) returns a non-nil error
+//     that is NOT authz.ErrDenied, so the caller denies the request without
+//     destroying the session — CONCERN 2.
+func (p *TokenValidator) reauthorizeStoredGrant(grantID, userID string) error {
+	if p.authorizer == nil {
+		return authz.ErrDenied
+	}
+
+	grant, err := p.db.GetGrant(grantID, userID)
+	if err != nil {
+		return fmt.Errorf("failed to load grant for re-authorization: %w", err)
+	}
+	// Defensive: production GetGrant errors on not-found (never returns nil,nil),
+	// but the interface permits it. A nil grant is an infrastructure condition,
+	// NOT an authorization deny, so return a non-ErrDenied error to avoid both a
+	// panic and revoking the session (CONCERN 2).
+	if grant == nil {
+		return fmt.Errorf("grant not found for re-authorization")
+	}
+
+	props := grant.Props
+	if props != nil {
+		decrypted, derr := encryption.DecryptPropsIfNeeded(p.encryptionKey, props)
+		if derr != nil {
+			return fmt.Errorf("failed to decrypt grant props for re-authorization: %w", derr)
+		}
+		props = decrypted
+	}
+
+	return authz.AuthorizeStoredProps(p.authorizer, props)
+}
+
+// revokeGrantTokens revokes the WHOLE session for a grant whose authorization
+// was revoked on refresh, forcing the client to re-authenticate. It revokes all
+// tokens for the grant (BLOCKER 2) and, defensively, the specific refresh/access
+// token pair too.
+func (p *TokenValidator) revokeGrantTokens(refreshToken string, tokenData *types.TokenData) {
+	if tokenData != nil && tokenData.GrantID != "" {
+		if err := p.db.RevokeTokensByGrant(tokenData.GrantID); err != nil {
+			fmt.Printf("Failed to revoke session by grant after authorization deny: %v\n", err)
+		}
+	}
+	if err := p.db.RevokeToken(refreshToken); err != nil {
+		fmt.Printf("Failed to revoke refresh token after authorization deny: %v\n", err)
+	}
+	if tokenData != nil && tokenData.AccessToken != "" {
+		if err := p.db.RevokeToken(tokenData.AccessToken); err != nil {
+			fmt.Printf("Failed to revoke access token after authorization deny: %v\n", err)
+		}
+	}
 }
 
 func (p *TokenValidator) handleOauthFlow(w http.ResponseWriter, r *http.Request) {
@@ -320,6 +421,13 @@ func (p *TokenValidator) sendUnauthorizedResponse(w http.ResponseWriter, r *http
 
 func GetTokenInfo(r *http.Request) *tokens.TokenInfo {
 	v, _ := r.Context().Value(tokenInfoKey{}).(*tokens.TokenInfo)
+	return v
+}
+
+// GetBearerToken returns the inbound bearer/cookie token string stored on the
+// request context by WithTokenValidation, or "" if none.
+func GetBearerToken(r *http.Request) string {
+	v, _ := r.Context().Value(bearerTokenKey{}).(string)
 	return v
 }
 

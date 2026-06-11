@@ -237,6 +237,137 @@ func TestVerify_EmptyTokenIsError(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestVerify_ConfigurableGroupsClaim(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v, err := NewVerifier(context.Background(), Config{
+		Issuer:      testIssuer,
+		JWKSURL:     srv.URL,
+		Audience:    testAudience,
+		GroupsClaim: "roles",
+	})
+	require.NoError(t, err)
+
+	c := baseClaims()
+	// The non-standard claim name carries the groups; the standard "groups"
+	// claim is present but must be ignored when GroupsClaim is configured.
+	c["roles"] = []string{"x", "y"}
+	c["groups"] = []string{"ignored"}
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"x", "y"}, claims.Groups)
+}
+
+func TestVerify_ConfigurableGroupsClaim_String(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v, err := NewVerifier(context.Background(), Config{
+		Issuer:      testIssuer,
+		JWKSURL:     srv.URL,
+		Audience:    testAudience,
+		GroupsClaim: "roles",
+	})
+	require.NoError(t, err)
+
+	c := baseClaims()
+	c["roles"] = "solo"
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"solo"}, claims.Groups)
+}
+
+func TestVerify_DefaultGroupsClaimUnchanged(t *testing.T) {
+	// With no GroupsClaim configured, the standard "groups" claim is still used.
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["groups"] = []string{"g1"}
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"g1"}, claims.Groups)
+}
+
+func TestVerify_RejectsAlgNone(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	// Build an unsigned ("alg":"none") token manually.
+	tok := jwt.NewWithClaims(jwt.SigningMethodNone, baseClaims())
+	tok.Header["kid"] = testKID
+	raw, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
+	require.NoError(t, err)
+
+	_, err = v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_RejectsHMACSignedToken(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	// An attacker-controlled HMAC token must be rejected: HS256 is not in the
+	// verifier's allowed methods.
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, baseClaims())
+	tok.Header["kid"] = testKID
+	raw, err := tok.SignedString([]byte("shared-secret"))
+	require.NoError(t, err)
+
+	_, err = v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_NullGroupsYieldsEmpty(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["groups"] = nil
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Empty(t, claims.Groups)
+}
+
+func TestVerify_MixedTypeGroupsArrayRejected(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["groups"] = []any{"a", 1}
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_ArrayAudienceAccepted(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	// aud as a JSON array that includes the expected audience.
+	c["aud"] = []string{"other-client", testAudience}
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, "user@example.com", claims.Email)
+}
+
 func TestClaims_UnmarshalGroups(t *testing.T) {
 	tests := []struct {
 		name string

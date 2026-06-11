@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gptscript-ai/cmd"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/proxy"
@@ -27,6 +28,16 @@ type RootCmd struct {
 	OAuthClientSecret string `name:"oauth-client-secret" env:"OAUTH_CLIENT_SECRET" usage:"OAuth client secret from your OAuth provider" required:"true"`
 	OAuthAuthorizeURL string `name:"oauth-authorize-url" env:"OAUTH_AUTHORIZE_URL" usage:"Authorization endpoint URL from your OAuth provider (e.g., https://accounts.google.com)" required:"true"`
 	OAuthJWKSURL      string `name:"oauth-jwks-url" env:"OAUTH_JWKS_URL" usage:"JWKS endpoint URL from your OAuth provider (e.g., https://accounts.google.com/.well-known/openid-configuration/jwks)"`
+	OAuthIssuerURL    string `name:"oauth-issuer-url" env:"OAUTH_ISSUER_URL" usage:"Expected id_token issuer (iss). Overrides the issuer derived from the authorize URL; required for path-based issuers like Keycloak (https://host/realms/x)"`
+
+	// Authorization / allowlist (oauth2-proxy parity). WARNING: with none of
+	// these set, the proxy DENIES ALL authenticated users (fail-closed default).
+	AllowedEmails              string `name:"allowed-emails" env:"ALLOWED_EMAILS" usage:"Comma-separated list of allowed email addresses"`
+	AllowedEmailsFile          string `name:"allowed-emails-file" env:"ALLOWED_EMAILS_FILE" usage:"Path to a file of allowed emails, one per line (blank lines and lines starting with # are ignored)"`
+	AllowedEmailDomains        string `name:"allowed-email-domains" env:"ALLOWED_EMAIL_DOMAINS" usage:"Comma-separated list of allowed email domains. The special value '*' allows ANY authenticated user"`
+	AllowedGroups              string `name:"allowed-groups" env:"ALLOWED_GROUPS" usage:"Comma-separated list of allowed groups"`
+	GroupsClaim                string `name:"groups-claim" env:"GROUPS_CLAIM" usage:"id_token claim that carries the user's groups" default:"groups"`
+	AllowedGoogleHostedDomains string `name:"allowed-google-hosted-domains" env:"ALLOWED_GOOGLE_HOSTED_DOMAINS" usage:"Comma-separated list of allowed Google hosted domains (checked against the 'hd' claim)"`
 
 	// Scopes and MCP configuration
 	ScopesSupported string `name:"scopes-supported" env:"SCOPES_SUPPORTED" usage:"Comma-separated list of supported OAuth scopes (e.g., 'openid,profile,email')" required:"true"`
@@ -68,11 +79,19 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		OAuthClientSecret: c.OAuthClientSecret,
 		OAuthAuthorizeURL: c.OAuthAuthorizeURL,
 		OAuthJWKSURL:      c.OAuthJWKSURL,
+		OAuthIssuerURL:    c.OAuthIssuerURL,
 		ScopesSupported:   c.ScopesSupported,
 		MCPServerURL:      c.MCPServerURL,
 		EncryptionKey:     c.EncryptionKey,
 		Mode:              c.Mode,
 		RoutePrefix:       c.RoutePrefix,
+
+		AllowedEmails:              parseCommaList(c.AllowedEmails),
+		AllowedEmailsFile:          c.AllowedEmailsFile,
+		AllowedEmailDomains:        parseCommaList(c.AllowedEmailDomains),
+		AllowedGroups:              parseCommaList(c.AllowedGroups),
+		GroupsClaim:                c.GroupsClaim,
+		AllowedGoogleHostedDomains: parseCommaList(c.AllowedGoogleHostedDomains),
 	}
 
 	// Validate configuration
@@ -102,6 +121,22 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 	log.Printf("Database: %s", c.getDatabaseType())
 
 	return http.ListenAndServe(address, handler)
+}
+
+// parseCommaList splits a comma-separated string into a trimmed, non-empty
+// slice. An empty input yields a nil slice.
+func parseCommaList(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func (c *RootCmd) validateConfig() error {
