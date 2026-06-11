@@ -332,6 +332,34 @@ export ALLOWED_EMAILS="alice@example.com,bob@example.com"
 - Microsoft: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize`
 - GitHub: `https://github.com/login/oauth/authorize`
 
+## Graceful re-authentication
+
+When a session/token expires, or an upstream/refresh is rejected, the proxy
+recovers cleanly instead of returning a bare `500` or a half-written stream:
+
+- **Agents (non-browser clients)** receive a `401` carrying a
+  `WWW-Authenticate` challenge plus a pointer to the protected-resource
+  metadata, so they can re-run discovery / PKCE:
+
+  ```
+  WWW-Authenticate: Bearer error="invalid_token", error_description="...", resource_metadata="<base-url>/.well-known/oauth-protected-resource<path>"
+  ```
+
+  with a JSON body `{"error":"invalid_token","error_description":"..."}`. This is
+  the same challenge whether the token is invalid at initial validation, the
+  in-request access token expired with no refresh token, or the upstream refresh
+  was rejected.
+- **Browsers** (a `mozilla` user-agent on a non-MCP path) are redirected back
+  through the IdP login flow (`302`, with `X-Redirect-URL` set) rather than
+  shown a JSON error.
+- **Refresh tokens renew silently**: when a session is within its refresh
+  window, the proxy rotates the access/refresh tokens transparently and the
+  request proceeds — no full re-login.
+- **A user de-authorized mid-session** (removed from the allowlist) is revoked
+  and challenged on the next refresh: the whole session is revoked first, then
+  the agent receives the `401` challenge above (browsers are sent back to
+  login).
+
 ## Forwarding the ID token to the upstream
 
 By default the proxy forwards nothing on the upstream `Authorization` header:

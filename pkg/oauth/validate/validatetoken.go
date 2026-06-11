@@ -406,24 +406,23 @@ func (p *TokenValidator) sendUnauthorizedResponse(w http.ResponseWriter, r *http
 		return
 	}
 
-	w.Header().Set(
-		"WWW-Authenticate",
-		fmt.Sprintf(
-			`Bearer error="invalid_token", error_description="%s", resource_metadata="%s"`,
-			message,
-			fmt.Sprintf("%s/.well-known/oauth-protected-resource%s", handlerutils.GetBaseURL(r), r.URL.Path),
-		),
-	)
-
-	handlerutils.JSON(w, http.StatusUnauthorized, map[string]string{
-		"error":             "invalid_token",
-		"error_description": message,
-	})
+	// Agent / non-browser path: emit the shared 401 re-auth challenge so the
+	// client can re-run discovery / PKCE. Shared with the proxy in-request
+	// expiry/deny paths so all agent challenges are byte-for-byte identical.
+	handlerutils.WriteBearerChallenge(w, r, message)
 }
 
 func GetTokenInfo(r *http.Request) *tokens.TokenInfo {
 	v, _ := r.Context().Value(tokenInfoKey{}).(*tokens.TokenInfo)
 	return v
+}
+
+// ContextWithTokenInfo returns a context carrying tokenInfo under the same key
+// WithTokenValidation uses, so GetTokenInfo can retrieve it. Exposed so callers
+// and tests can stage a validated identity onto the request without re-running
+// the full validation middleware.
+func ContextWithTokenInfo(ctx context.Context, tokenInfo *tokens.TokenInfo) context.Context {
+	return context.WithValue(ctx, tokenInfoKey{}, tokenInfo)
 }
 
 // GetBearerToken returns the inbound bearer/cookie token string stored on the
