@@ -43,6 +43,20 @@ type Config struct {
 	AllowedGroups              []string // allowed groups (intersection with the user's groups)
 	GroupsClaim                string   // id_token claim carrying groups (default "groups")
 	AllowedGoogleHostedDomains []string // allowed Google hosted domains ("hd" claim)
+
+	// Upstream token forwarding (F4f). Controls whether/how the VERIFIED OIDC
+	// id_token (or the access token) is forwarded to the upstream MCP server.
+	//
+	// AuthorizationHeaderToken selects which token is placed on the upstream
+	// request: "none" (default; no Authorization set, current behavior),
+	// "access_token" (Authorization: Bearer <access_token>), or "id_token"
+	// (forward the verified id_token, see IDTokenHeader for the destination).
+	//
+	// IDTokenHeader optionally names a custom header to carry the raw id_token
+	// (without a "Bearer " prefix). When empty and id_token forwarding is
+	// active, the id_token is sent as "Authorization: Bearer <id_token>".
+	AuthorizationHeaderToken string
+	IDTokenHeader            string
 }
 
 // TokenData represents stored token data for OAuth 2.1 compliance
