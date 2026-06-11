@@ -131,11 +131,89 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `MCP_SERVER_URL`      | ✅       | Your MCP server endpoint                                  |
 | `DATABASE_DSN`        | ❌       | Database connection string (defaults to SQLite)           |
 | `ENCRYPTION_KEY`      | ✅       | Base64-encoded 32-byte AES key                            |
+| `OAUTH_JWKS_URL`      | ❌       | Provider JWKS endpoint (enables id_token verification)    |
+| `OAUTH_ISSUER_URL`    | ❌       | Expected id_token issuer (`iss`); see Authorization below |
+| `ALLOWED_EMAILS`            | ❌ | Comma-separated allowed email addresses                          |
+| `ALLOWED_EMAILS_FILE`       | ❌ | Path to a file of allowed emails (one per line)                  |
+| `ALLOWED_EMAIL_DOMAINS`     | ❌ | Comma-separated allowed email domains; `*` allows ANY user       |
+| `ALLOWED_GROUPS`            | ❌ | Comma-separated allowed groups                                   |
+| `GROUPS_CLAIM`              | ❌ | id_token claim carrying groups (default `groups`)                |
+| `ALLOWED_GOOGLE_HOSTED_DOMAINS` | ❌ | Comma-separated allowed Google hosted domains (`hd` claim)  |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
 
 ```bash
 openssl rand -base64 32
+```
+
+## Authorization / Allowlist
+
+> [!WARNING]
+> **BREAKING CHANGE — DENY-ALL BY DEFAULT.** With **none** of the `ALLOWED_*`
+> variables set, the proxy now **denies every authenticated user** (fail-closed,
+> for parity with oauth2-proxy). This is a deliberate change from the previous
+> "any authenticated user is allowed" behavior. To restore the old open behavior
+> explicitly, set `ALLOWED_EMAIL_DOMAINS=*`.
+
+The proxy enforces **who** may use it directly against the verified IdP identity,
+in addition to verifying that the user is authenticated. Authorization is decided
+**claims-first** off the verified `id_token`, falling back to the provider
+userinfo endpoint only for an attribute a configured rule needs but the
+`id_token` did not supply. If a required attribute is still missing, the request
+is **denied** (fail-closed).
+
+### Rules
+
+If any allow input is set, a request is allowed if it matches **at least one**
+rule (rules OR together); otherwise it is denied with a clear `403`
+(`access_denied`).
+
+- **`ALLOWED_EMAILS`** / **`ALLOWED_EMAILS_FILE`** — explicit email addresses.
+  Matching is case-insensitive and trimmed. The file lists one email per line;
+  blank lines and lines starting with `#` are ignored. The file is **merged**
+  with `ALLOWED_EMAILS` and loaded **once at startup** (reload requires a
+  restart).
+- **`ALLOWED_EMAIL_DOMAINS`** — the domain after `@`, case-insensitive. The
+  special value `*` allows **any** authenticated user (the escape hatch that
+  restores the legacy open behavior; mirrors oauth2-proxy `--email-domain=*`).
+- **`ALLOWED_GROUPS`** — allowed if the user's groups intersect this list. The
+  groups claim name is configurable via **`GROUPS_CLAIM`** (default `groups`).
+- **`ALLOWED_GOOGLE_HOSTED_DOMAINS`** — checked against the OIDC `hd` claim.
+
+> [!NOTE]
+> **Email verification required.** An email or email-domain rule is satisfied
+> only when the IdP asserts `email_verified == true`. An unverified email will
+> NOT match an email/domain rule.
+
+### Re-checked on every refresh
+
+The allowlist is re-evaluated on **every token refresh**. If a previously
+allowed user no longer matches (e.g. removed from `ALLOWED_EMAILS`), their
+session is revoked on the next refresh and they must re-authenticate (the agent
+receives a `401`; browser sessions are sent back through login). When a refresh
+returns a fresh `id_token` it is re-verified and the stored claims are updated
+before the re-check; otherwise the stored claims (or userinfo) are used.
+
+### `OAUTH_ISSUER_URL`
+
+When verifying the IdP `id_token`, the expected issuer (`iss`) defaults to the
+origin (`scheme://host`) of `OAUTH_AUTHORIZE_URL`. For providers with a
+path-based issuer (e.g. Keycloak `https://host/realms/your-realm`), set
+`OAUTH_ISSUER_URL` to the exact issuer string; it overrides the derived value.
+
+### Recipe: drop Keycloak, point at Google directly
+
+```bash
+export OAUTH_CLIENT_ID="...apps.googleusercontent.com"
+export OAUTH_CLIENT_SECRET="..."
+export OAUTH_AUTHORIZE_URL="https://accounts.google.com"
+export OAUTH_JWKS_URL="https://www.googleapis.com/oauth2/v3/certs"
+export SCOPES_SUPPORTED="openid,profile,email"
+# Authorize exactly who may use the proxy:
+export ALLOWED_EMAILS="alice@example.com,bob@example.com"
+# or by domain / Google hosted domain:
+# export ALLOWED_EMAIL_DOMAINS="example.com"
+# export ALLOWED_GOOGLE_HOSTED_DOMAINS="example.com"
 ```
 
 **Different Auth Provider URLs:**

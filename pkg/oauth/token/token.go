@@ -3,6 +3,7 @@ package token
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/authz"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
@@ -23,15 +25,24 @@ type TokenStore interface {
 	DeleteAuthCode(code string) error
 	GetTokenByRefreshToken(refreshToken string) (*types.TokenData, error)
 	RevokeToken(token string) error
+	RevokeTokensByGrant(grantID string) error
 }
 
 type Handler struct {
 	db TokenStore
+	// authorizer enforces the allowlist; it is re-checked on the refresh_token
+	// grant so agents using standard OAuth2 refresh are re-evaluated on every
+	// refresh. A nil authorizer fails closed (deny).
+	authorizer *authz.Authorizer
+	// encryptionKey decrypts grant props for the refresh-time re-authorization.
+	encryptionKey []byte
 }
 
-func NewHandler(db TokenStore) http.Handler {
+func NewHandler(db TokenStore, authorizer *authz.Authorizer, encryptionKey []byte) http.Handler {
 	return &Handler{
-		db: db,
+		db:            db,
+		authorizer:    authorizer,
+		encryptionKey: encryptionKey,
 	}
 }
 
@@ -249,8 +260,36 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	handlerutils.JSON(w, http.StatusOK, response)
 }
 
+// reauthorizeGrant re-derives the identity from the grant's stored (decrypted)
+// props and re-runs the allowlist. It fails closed: a nil authorizer returns
+// authz.ErrDenied. A props-decrypt failure returns a non-ErrDenied error so the
+// caller treats it as an infrastructure error (deny this request, keep the
+// session) rather than an authorization deny (CONCERN 2).
+func (p *Handler) reauthorizeGrant(grant *types.Grant) error {
+	// Defensive: production GetGrant errors on not-found (never returns nil,nil),
+	// but the interface permits it. A nil grant is an infrastructure condition,
+	// NOT an authorization deny, so return a non-ErrDenied error to avoid both a
+	// panic and revoking the session (CONCERN 2).
+	if grant == nil {
+		return fmt.Errorf("grant not found for re-authorization")
+	}
+	props := grant.Props
+	if props != nil {
+		decrypted, derr := encryption.DecryptPropsIfNeeded(p.encryptionKey, props)
+		if derr != nil {
+			return fmt.Errorf("failed to decrypt grant props for re-authorization: %w", derr)
+		}
+		props = decrypted
+	}
+	return authz.AuthorizeStoredProps(p.authorizer, props)
+}
+
 func (p *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, clientID string) {
-	refreshToken := r.FormValue("refresh_token")
+	// Capture the inbound (old) refresh token up front. It is the token to
+	// revoke after rotation; the local refreshToken variable is later reused for
+	// the newly generated token (BLOCKER 4).
+	oldRefreshToken := r.FormValue("refresh_token")
+	refreshToken := oldRefreshToken
 
 	// Validate refresh token from database
 	tokenData, err := p.db.GetTokenByRefreshToken(refreshToken)
@@ -290,11 +329,40 @@ func (p *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	}
 
 	// Get the grant to access props
-	_, err = p.db.GetGrant(tokenData.GrantID, tokenData.UserID)
+	grant, err := p.db.GetGrant(tokenData.GrantID, tokenData.UserID)
 	if err != nil {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 			Error:            "invalid_grant",
 			ErrorDescription: "Grant not found",
+		})
+		return
+	}
+
+	// Re-check the allowlist on every refresh_token grant (BLOCKER 3). This is
+	// the standard OAuth2 POST /token path used by agents; without this re-check
+	// it would be a full bypass of "re-check on every refresh". This path does
+	// NOT contact the IdP, so the identity is re-derived from the STORED grant
+	// claims (same approach as the internal validate refresh). On an actual
+	// authorization DENY we revoke the WHOLE session and refuse to issue tokens.
+	// On an infrastructure error (props decrypt failure) we fail closed for THIS
+	// request but keep the session (CONCERN 2).
+	if err := p.reauthorizeGrant(grant); err != nil {
+		if errors.Is(err, authz.ErrDenied) {
+			log.Printf("authorization revoked on refresh_token grant for grant=%q: %v", tokenData.GrantID, err)
+			if rerr := p.db.RevokeTokensByGrant(tokenData.GrantID); rerr != nil {
+				log.Printf("Failed to revoke session by grant after authorization deny: %v", rerr)
+			}
+			handlerutils.JSON(w, http.StatusForbidden, types.OAuthError{
+				Error:            "access_denied",
+				ErrorDescription: "Access denied: you are no longer authorized to use this resource",
+			})
+			return
+		}
+		// Infrastructure error: deny this request, preserve the session.
+		log.Printf("authorization re-check failed on refresh_token grant for grant=%q (session preserved): %v", tokenData.GrantID, err)
+		handlerutils.JSON(w, http.StatusUnauthorized, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "Authorization re-check failed",
 		})
 		return
 	}
@@ -330,8 +398,11 @@ func (p *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Revoke the old refresh token
-	if err := p.db.RevokeToken(refreshToken); err != nil {
+	// Revoke the OLD (inbound) refresh token, not the freshly minted one
+	// (BLOCKER 4). At this point `refreshToken` has been reassigned to the new
+	// token, so we must revoke the captured oldRefreshToken to make the previous
+	// token unusable and complete the rotation.
+	if err := p.db.RevokeToken(oldRefreshToken); err != nil {
 		log.Printf("Failed to revoke old refresh token: %v", err)
 	}
 

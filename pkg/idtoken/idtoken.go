@@ -107,16 +107,26 @@ type Config struct {
 	// Audience is the expected "aud" claim value, which for an id_token is the
 	// proxy's OAuth client ID.
 	Audience string
+	// GroupsClaim is the name of the claim that carries the user's groups. When
+	// empty it defaults to the standard "groups" claim. A configured value lets
+	// the proxy read groups from a provider-specific claim (e.g. "roles"). The
+	// value, like "groups", may be a JSON string or a JSON array of strings.
+	GroupsClaim string
 	// HTTPClient is an optional HTTP client used to fetch the JWKS. If nil, a
 	// default client is used. Primarily a test seam.
 	HTTPClient *http.Client
 }
 
+// DefaultGroupsClaim is the claim name used to extract groups when no
+// GroupsClaim is configured.
+const DefaultGroupsClaim = "groups"
+
 // Verifier verifies IdP-issued id_tokens and extracts normalized Claims.
 type Verifier struct {
-	issuer   string
-	audience string
-	keyFunc  keyfunc.Keyfunc
+	issuer      string
+	audience    string
+	groupsClaim string
+	keyFunc     keyfunc.Keyfunc
 }
 
 // NewVerifier constructs a Verifier that fetches and caches JWKS from
@@ -146,10 +156,16 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 		return nil, fmt.Errorf("idtoken: failed to build JWKS key function: %w", err)
 	}
 
+	groupsClaim := cfg.GroupsClaim
+	if groupsClaim == "" {
+		groupsClaim = DefaultGroupsClaim
+	}
+
 	return &Verifier{
-		issuer:   cfg.Issuer,
-		audience: cfg.Audience,
-		keyFunc:  kf,
+		issuer:      cfg.Issuer,
+		audience:    cfg.Audience,
+		groupsClaim: groupsClaim,
+		keyFunc:     kf,
 	}, nil
 }
 
@@ -195,23 +211,70 @@ func (v *Verifier) Verify(ctx context.Context, rawIDToken string) (*Claims, erro
 		return nil, fmt.Errorf("idtoken: unexpected claims type")
 	}
 
+	groups, err := extractGroups(jc.raw, v.groupsClaim)
+	if err != nil {
+		return nil, fmt.Errorf("idtoken: %w", err)
+	}
+
 	return &Claims{
 		Email:         jc.Email,
 		EmailVerified: jc.EmailVerified,
-		Groups:        []string(jc.Groups),
+		Groups:        groups,
 		HostedDomain:  jc.HostedDomain,
 		Subject:       jc.Subject,
 	}, nil
 }
 
+// extractGroups pulls the groups claim named claimName out of the raw claim set
+// and normalizes it via groupsValue (tolerating a single string or an array of
+// strings). An absent or null claim yields no groups; a malformed value (e.g. a
+// mixed-type array) is an error so the caller fails closed rather than silently
+// dropping groups.
+func extractGroups(raw map[string]json.RawMessage, claimName string) ([]string, error) {
+	if claimName == "" {
+		claimName = DefaultGroupsClaim
+	}
+	rawVal, ok := raw[claimName]
+	if !ok || len(rawVal) == 0 || string(rawVal) == "null" {
+		return nil, nil
+	}
+	var g groupsValue
+	if err := g.UnmarshalJSON(rawVal); err != nil {
+		return nil, fmt.Errorf("groups claim %q: %w", claimName, err)
+	}
+	return []string(g), nil
+}
+
 // jwtClaims embeds jwt.RegisteredClaims so the jwt parser validates the
 // standard exp/iss/aud claims, and adds the provider-specific identity claims
 // this proxy extracts. "sub" is intentionally taken from RegisteredClaims to
-// avoid a duplicate JSON tag; it is copied into Claims.Subject afterward.
+// avoid a duplicate JSON tag; it is copied into Claims.Subject afterward. The
+// full raw claim set is captured so a configurable groups claim (by name) can be
+// extracted after standard validation.
 type jwtClaims struct {
 	jwt.RegisteredClaims
-	Email         string      `json:"email,omitempty"`
-	EmailVerified bool        `json:"email_verified,omitempty"`
-	Groups        groupsValue `json:"groups,omitempty"`
-	HostedDomain  string      `json:"hd,omitempty"`
+	Email         string `json:"email,omitempty"`
+	EmailVerified bool   `json:"email_verified,omitempty"`
+	HostedDomain  string `json:"hd,omitempty"`
+
+	// raw holds every top-level claim so the groups claim can be read by its
+	// configured name. It is populated by UnmarshalJSON.
+	raw map[string]json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON decodes the standard/identity fields via a shadow type (to avoid
+// recursion) and also captures the full raw claim set for later by-name groups
+// extraction.
+func (c *jwtClaims) UnmarshalJSON(data []byte) error {
+	type alias jwtClaims
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*c = jwtClaims(a)
+
+	if err := json.Unmarshal(data, &c.raw); err != nil {
+		return err
+	}
+	return nil
 }

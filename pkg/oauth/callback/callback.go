@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/authz"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/idtoken"
@@ -45,6 +46,9 @@ type Handler struct {
 	// verified and no id_token claims are stored, which is the behavior-neutral
 	// default for non-OIDC setups.
 	idTokenVerifier IDTokenVerifier
+	// authorizer enforces the allowlist (who may use the proxy). It is always
+	// non-nil; a zero-config authorizer denies everyone (fail-closed default).
+	authorizer *authz.Authorizer
 }
 
 // MCPUIManager interface for generating JWT tokens
@@ -52,7 +56,7 @@ type MCPUIManager interface {
 	GenerateMCPUICodeForDownstream(bearerToken, refreshToken string) (string, error)
 }
 
-func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier) http.Handler {
+func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier, authorizer *authz.Authorizer) http.Handler {
 	return &Handler{
 		db:               db,
 		provider:         provider,
@@ -62,6 +66,7 @@ func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, cli
 		routePrefix:      routePrefix,
 		cookieNamePrefix: cookieNamePrefix,
 		idTokenVerifier:  idTokenVerifier,
+		authorizer:       authorizer,
 	}
 }
 
@@ -221,9 +226,31 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if scope includes profile or email before getting user info
+	// If the IdP returned an OIDC id_token and an id_token verifier is
+	// configured, verify it and capture normalized claims. Authorization is made
+	// claims-first off these verified claims. If no id_token is present we
+	// proceed with empty claims and rely on the userinfo fallback. If
+	// verification FAILS, we reject the login rather than silently proceeding
+	// with an unverified token.
+	idTokenClaims, rawIDToken, err := p.verifyIDToken(r.Context(), tokenInfo)
+	if err != nil {
+		log.Printf("Failed to verify id_token: %v", err)
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "Failed to verify identity token",
+		})
+		return
+	}
+
+	// Check if scope includes profile or email before getting user info. We also
+	// fetch userinfo when the authorizer needs an attribute (email) that the
+	// id_token did not supply, so authorization can fall back to userinfo.
 	scopes := strings.Fields(authReq.Scope)
 	needsUserInfo := p.scopeContainsProfileOrEmail(scopes)
+	if p.authorizer != nil && p.authorizer.NeedsEmail() &&
+		(idTokenClaims == nil || idTokenClaims.Email == "") {
+		needsUserInfo = true
+	}
 
 	userInfo := &providers.UserInfo{}
 	if needsUserInfo {
@@ -239,18 +266,27 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// If the IdP returned an OIDC id_token and an id_token verifier is
-	// configured, verify it and capture normalized claims for storage. This is
-	// behavior-neutral: claims are only stored, never forwarded or used to gate
-	// the request here. If no id_token is present, we proceed unchanged with
-	// empty claims. If verification FAILS, we reject the login rather than
-	// silently proceeding with an unverified token.
-	idTokenClaims, rawIDToken, err := p.verifyIDToken(r.Context(), tokenInfo)
-	if err != nil {
-		log.Printf("Failed to verify id_token: %v", err)
-		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
-			Error:            "invalid_grant",
-			ErrorDescription: "Failed to verify identity token",
+	// Enforce the allowlist (WHO may use the proxy) against the verified id_token
+	// claims first, falling back to userinfo for attributes a rule needs but the
+	// id_token lacked. A zero-config authorizer denies everyone (fail-closed
+	// default). On deny we return 403 access_denied and store nothing.
+	identity := authz.IdentityFromClaims(idTokenClaims)
+	identity = authz.MergeUserInfo(identity, userInfo.Email, userInfo.EmailVerified)
+	if p.authorizer == nil {
+		// Defensive: a nil authorizer would mean "no allowlist", which violates
+		// the fail-closed contract. Deny.
+		log.Printf("authorization denied: no authorizer configured")
+		handlerutils.JSON(w, http.StatusForbidden, types.OAuthError{
+			Error:            "access_denied",
+			ErrorDescription: "Access denied",
+		})
+		return
+	}
+	if err := p.authorizer.Authorize(identity); err != nil {
+		log.Printf("authorization denied for subject=%q: %v", identity.Subject, err)
+		handlerutils.JSON(w, http.StatusForbidden, types.OAuthError{
+			Error:            "access_denied",
+			ErrorDescription: "Access denied: you are not authorized to use this resource",
 		})
 		return
 	}
@@ -289,6 +325,15 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sensitiveProps["name"] = userInfo.Name
 		infoJSON, _ := json.Marshal(userInfo)
 		sensitiveProps["info"] = string(infoJSON)
+
+		// Keep the top-level email/email_verified pair SELF-CONSISTENT: the stored
+		// email is the userinfo email, so its verified flag MUST be the userinfo
+		// email's verified state. Borrowing the id_token's EmailVerified here would
+		// describe a DIFFERENT email and could promote an unverified userinfo
+		// address to verified on a later refresh re-check. The id_token's own
+		// email+verified live in id_token_claims and remain preferred by
+		// IdentityFromStoredProps.
+		sensitiveProps["email_verified"] = userInfo.EmailVerified
 	}
 
 	// Initialize props map

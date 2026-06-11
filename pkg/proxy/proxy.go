@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/handlers"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/authz"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/db"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
@@ -34,15 +37,17 @@ import (
 )
 
 type OAuthProxy struct {
-	metadata      *types.OAuthMetadata
-	db            *db.Store
-	rateLimiter   *ratelimit.RateLimiter
-	providers     *providers.Manager
-	tokenManager  *tokens.TokenManager
-	provider      string
-	encryptionKey []byte
-	resourceName  string
-	config        *types.Config
+	metadata        *types.OAuthMetadata
+	db              *db.Store
+	rateLimiter     *ratelimit.RateLimiter
+	providers       *providers.Manager
+	tokenManager    *tokens.TokenManager
+	provider        string
+	encryptionKey   []byte
+	resourceName    string
+	config          *types.Config
+	authorizer      *authz.Authorizer
+	idTokenVerifier callback.IDTokenVerifier
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -121,6 +126,31 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		return nil, fmt.Errorf("failed to decode encryption key: %w", err)
 	}
 
+	// Build the allowlist authorizer (WHO may use the proxy). The emails file is
+	// loaded once here (reload-on-restart only) and merged with the explicit
+	// emails list. A zero-config authorizer denies everyone (fail-closed
+	// breaking-change default).
+	allowedEmails := config.AllowedEmails
+	if config.AllowedEmailsFile != "" {
+		fileEmails, err := authz.LoadEmailsFile(config.AllowedEmailsFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load allowed emails file: %w", err)
+		}
+		allowedEmails = append(append([]string{}, allowedEmails...), fileEmails...)
+	}
+	authorizer, err := authz.New(authz.Config{
+		Emails:              allowedEmails,
+		EmailDomains:        config.AllowedEmailDomains,
+		Groups:              config.AllowedGroups,
+		GoogleHostedDomains: config.AllowedGoogleHostedDomains,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build authorizer: %w", err)
+	}
+	if !authorizer.Enabled() {
+		log.Println("WARNING: no allowlist configured (ALLOWED_EMAILS / ALLOWED_EMAIL_DOMAINS / ALLOWED_GROUPS / ALLOWED_GOOGLE_HOSTED_DOMAINS): DENYING ALL users. Set ALLOWED_EMAIL_DOMAINS=* to allow any authenticated user.")
+	}
+
 	// Split and trim scopes to handle whitespace
 	scopesSupported := ParseScopesSupported(config.ScopesSupported)
 
@@ -134,6 +164,13 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		RegistrationEndpointAuthMethodsSupported: []string{"client_secret_post"},
 	}
 
+	// Create the proxy-owned context up front so background goroutines tied to
+	// the proxy lifecycle (notably the id_token verifier's JWKS refresh) are
+	// cancelled when Close is called. Start may layer its own cancellation on
+	// top, but the verifier built in SetupRoutes must not leak a goroutine bound
+	// to context.Background().
+	ctx, cancel := context.WithCancel(context.Background())
+
 	return &OAuthProxy{
 		metadata:      metadata,
 		db:            db,
@@ -144,6 +181,9 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		resourceName:  "MCP Tools",
 		encryptionKey: encryptionKey,
 		config:        config,
+		authorizer:    authorizer,
+		ctx:           ctx,
+		cancel:        cancel,
 	}, nil
 }
 
@@ -155,12 +195,26 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 // id_token verification". This keeps startup working for non-OIDC setups (no
 // JWKS URL) and degrades gracefully if the verifier cannot be constructed.
 func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
-	issuer := oidcIssuerFromAuthorizeURL(p.config.OAuthAuthorizeURL)
+	// Use the explicitly configured issuer when set (required for path-based
+	// issuers like Keycloak https://host/realms/x); otherwise derive it from the
+	// authorize URL's origin.
+	issuer := p.config.OAuthIssuerURL
+	if issuer == "" {
+		issuer = oidcIssuerFromAuthorizeURL(p.config.OAuthAuthorizeURL)
+	}
 
-	verifier, err := idtoken.MaybeNewVerifier(context.Background(), idtoken.Config{
-		Issuer:   issuer,
-		JWKSURL:  p.config.OAuthJWKSURL,
-		Audience: p.config.OAuthClientID,
+	// Bind the verifier's JWKS background refresh to the proxy-owned context so
+	// it is cancelled in Close rather than leaking against context.Background().
+	ctx := p.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	verifier, err := idtoken.MaybeNewVerifier(ctx, idtoken.Config{
+		Issuer:      issuer,
+		JWKSURL:     p.config.OAuthJWKSURL,
+		Audience:    p.config.OAuthClientID,
+		GroupsClaim: p.config.GroupsClaim,
 	})
 	if err != nil {
 		// The parameters were present but the verifier could not be built
@@ -222,7 +276,22 @@ func (p *OAuthProxy) Close() error {
 }
 
 func (p *OAuthProxy) Start(ctx context.Context) error {
-	p.ctx, p.cancel = context.WithCancel(ctx)
+	// The proxy already owns a cancellable context created in NewOAuthProxy
+	// (used by the id_token verifier's JWKS refresh started in SetupRoutes).
+	// Tie that context to the caller's ctx so cancelling ctx also tears down
+	// proxy background goroutines, while Close still cancels everything via the
+	// original p.cancel. We deliberately do NOT replace p.ctx/p.cancel here so
+	// the verifier's refresh goroutine stays bound to the proxy lifecycle.
+	if p.ctx == nil {
+		p.ctx, p.cancel = context.WithCancel(context.Background())
+	}
+	if ctx != nil {
+		context.AfterFunc(ctx, func() {
+			if p.cancel != nil {
+				p.cancel()
+			}
+		})
+	}
 
 	// Setup cleanup goroutine for expired tokens
 	go func() {
@@ -258,12 +327,13 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	// setups (no JWKS URL configured) so the callback simply skips id_token
 	// verification rather than failing.
 	idTokenVerifier := p.buildIDTokenVerifier()
+	p.idTokenVerifier = idTokenVerifier
 
 	authorizeHandler := authorize.NewHandler(p.db, provider, p.metadata.ScopesSupported, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix)
-	tokenHandler := token.NewHandler(p.db)
-	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, idTokenVerifier)
+	tokenHandler := token.NewHandler(p.db, p.authorizer, p.encryptionKey)
+	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, idTokenVerifier, p.authorizer)
 	revokeHandler := revoke.NewHandler(p.db)
-	tokenValidator := validate.NewTokenValidator(p.tokenManager, p.encryptionKey, p.db, provider, p.config.RoutePrefix, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.CookieNamePrefix, p.config.MCPServerID, p.metadata.ScopesSupported, p.config.MCPPaths)
+	tokenValidator := validate.NewTokenValidator(p.tokenManager, p.encryptionKey, p.db, provider, p.config.RoutePrefix, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.CookieNamePrefix, p.config.MCPServerID, p.metadata.ScopesSupported, p.config.MCPPaths, p.authorizer, idTokenVerifier)
 	successHandler := success.NewHandler()
 
 	// Get route prefix from config
@@ -442,6 +512,33 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 						return
 					}
 
+					// Re-check the allowlist on every IdP token refresh (user
+					// decision). Re-derive the identity from a fresh id_token if
+					// the provider returned one (re-verifying and updating the
+					// stored claims), otherwise from the stored claims/userinfo.
+					// On deny: revoke the session and return 401 so the agent
+					// re-runs discovery. Never a 500.
+					refreshedProps, denied := p.reauthorizeOnRefresh(r.Context(), tokenInfo.Props, newTokenInfo)
+					if denied != nil {
+						// Only revoke the whole session on an actual authorization
+						// DENY. On an infrastructure error (e.g. a transient
+						// id_token verify failure) we fail closed for THIS request
+						// but keep the session so a blip does not log everyone out
+						// (CONCERN 2). Either way: 401, never 500.
+						if errors.Is(denied, authz.ErrDenied) {
+							log.Printf("authorization revoked on refresh for user=%q: %v", tokenInfo.UserID, denied)
+							p.revokeGrantOnDeny(r, tokenInfo.GrantID)
+						} else {
+							log.Printf("authorization re-check failed on refresh for user=%q (session preserved): %v", tokenInfo.UserID, denied)
+						}
+						handlerutils.JSON(w, http.StatusUnauthorized, map[string]string{
+							"error":             "invalid_token",
+							"error_description": "Access revoked: you are no longer authorized to use this resource",
+						})
+						return
+					}
+					tokenInfo.Props = refreshedProps
+
 					// Update the grant with new token information
 					if err := p.updateGrant(tokenInfo.GrantID, tokenInfo.UserID, tokenInfo, newTokenInfo); err != nil {
 						log.Printf("Failed to update grant: %v", err)
@@ -538,6 +635,64 @@ func setHeaders(header http.Header, props map[string]any) {
 		header.Set("X-Forwarded-Access-Token", accessToken)
 	} else {
 		header.Del("X-Forwarded-Access-Token")
+	}
+}
+
+// reauthorizeOnRefresh re-derives the user's identity after an IdP token refresh
+// and re-runs the allowlist. If the refresh returned a fresh id_token it is
+// re-verified (V0) and the stored claims are updated; otherwise the identity is
+// taken from the previously stored claims/userinfo. It returns the (possibly
+// updated) props to persist, and a non-nil error when the user is no longer
+// authorized (the caller must revoke and emit 401/redirect, never 500).
+func (p *OAuthProxy) reauthorizeOnRefresh(ctx context.Context, oldProps map[string]any, newTokenInfo *oauth2.Token) (map[string]any, error) {
+	// Copy so we never mutate the caller's map on the deny path.
+	props := map[string]any{}
+	maps.Copy(props, oldProps)
+
+	// If the provider returned a fresh id_token and we have a verifier, verify
+	// it and refresh the stored claims so authorization uses current data.
+	if p.idTokenVerifier != nil && newTokenInfo != nil {
+		if rawIDToken, _ := newTokenInfo.Extra("id_token").(string); rawIDToken != "" {
+			claims, err := p.idTokenVerifier.Verify(ctx, rawIDToken)
+			if err != nil {
+				// A returned-but-invalid id_token must fail closed.
+				return props, fmt.Errorf("failed to verify refreshed id_token: %w", err)
+			}
+			if claimsJSON, mErr := json.Marshal(claims); mErr == nil {
+				props["id_token_claims"] = string(claimsJSON)
+				props["id_token"] = rawIDToken
+			}
+		}
+	}
+
+	if p.authorizer == nil {
+		// Fail closed: a missing authorizer must deny, never allow (CONCERN 1).
+		return props, authz.ErrDenied
+	}
+
+	identity := authz.IdentityFromStoredProps(props)
+	if err := p.authorizer.Authorize(identity); err != nil {
+		return props, err
+	}
+	return props, nil
+}
+
+// revokeGrantOnDeny revokes the WHOLE session for a grant whose authorization
+// was revoked on refresh, forcing the client to re-authenticate. Revoking by
+// grant kills every token (access and refresh, across rotations) for the
+// session, not just the inbound bearer, so a browser holding a refresh-token
+// cookie cannot continue (BLOCKER 2). The inbound bearer is also revoked
+// defensively in case it has no grant association.
+func (p *OAuthProxy) revokeGrantOnDeny(r *http.Request, grantID string) {
+	if grantID != "" {
+		if err := p.db.RevokeTokensByGrant(grantID); err != nil {
+			log.Printf("Failed to revoke session by grant after authorization deny: %v", err)
+		}
+	}
+	if bearer := validate.GetBearerToken(r); bearer != "" {
+		if err := p.db.RevokeToken(bearer); err != nil {
+			log.Printf("Failed to revoke bearer token after authorization deny: %v", err)
+		}
 	}
 }
 
