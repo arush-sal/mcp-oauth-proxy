@@ -36,13 +36,16 @@ type Handler struct {
 	authorizer *authz.Authorizer
 	// encryptionKey decrypts grant props for the refresh-time re-authorization.
 	encryptionKey []byte
+	// session carries the resolved access/refresh token lifetimes.
+	session types.SessionConfig
 }
 
-func NewHandler(db TokenStore, authorizer *authz.Authorizer, encryptionKey []byte) http.Handler {
+func NewHandler(db TokenStore, authorizer *authz.Authorizer, encryptionKey []byte, session types.SessionConfig) http.Handler {
 	return &Handler{
 		db:            db,
 		authorizer:    authorizer,
 		encryptionKey: encryptionKey,
+		session:       session,
 	}
 }
 
@@ -231,8 +234,13 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		UserID:       userID,
 		GrantID:      grantID,
 		Scope:        strings.Join(grant.Scope, " "),
-		ExpiresAt:    time.Now().Add(time.Duration(3600) * time.Second),
-		CreatedAt:    time.Now(),
+		ExpiresAt:    time.Now().Add(p.session.AccessTTL),
+		// Set the refresh expiry explicitly from the configured RefreshTTL.
+		// Leaving it zero would let db.StoreToken apply a hardcoded 30-day
+		// fallback, silently ignoring a custom COOKIE_REFRESH on the initial
+		// authorization-code token issuance.
+		RefreshTokenExpiresAt: time.Now().Add(p.session.RefreshTTL),
+		CreatedAt:             time.Now(),
 	}
 
 	if err := p.db.StoreToken(tokenData); err != nil {
@@ -252,7 +260,7 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	response := types.TokenResponse{
 		AccessToken:  accessToken,
 		TokenType:    "Bearer",
-		ExpiresIn:    3600,
+		ExpiresIn:    p.session.AccessTTLSeconds(),
 		RefreshToken: refreshToken,
 		Scope:        strings.Join(grant.Scope, " "),
 	}
@@ -374,7 +382,7 @@ func (p *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	// Generate new refresh token
 	refreshTokenSecret := encryption.GenerateRandomString(32)
 	refreshToken = fmt.Sprintf("%s:%s:%s", tokenData.UserID, tokenData.GrantID, refreshTokenSecret)
-	refreshTokenExpiresAt := time.Now().Add(30 * 24 * time.Hour) // 30 days from now
+	refreshTokenExpiresAt := time.Now().Add(p.session.RefreshTTL)
 
 	// Store new token in database (replaces the old one)
 	newTokenData := &types.TokenData{
@@ -384,7 +392,7 @@ func (p *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 		UserID:                tokenData.UserID,
 		GrantID:               tokenData.GrantID,
 		Scope:                 tokenData.Scope,
-		ExpiresAt:             time.Now().Add(3600 * time.Second),
+		ExpiresAt:             time.Now().Add(p.session.AccessTTL),
 		RefreshTokenExpiresAt: refreshTokenExpiresAt,
 		CreatedAt:             time.Now(),
 	}
@@ -409,7 +417,7 @@ func (p *Handler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request
 	response := types.TokenResponse{
 		AccessToken:  accessToken,
 		TokenType:    "Bearer",
-		ExpiresIn:    3600,
+		ExpiresIn:    p.session.AccessTTLSeconds(),
 		RefreshToken: refreshToken,
 		Scope:        tokenData.Scope,
 	}

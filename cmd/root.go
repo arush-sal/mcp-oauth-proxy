@@ -51,6 +51,13 @@ type RootCmd struct {
 	// Security configuration
 	EncryptionKey string `name:"encryption-key" env:"ENCRYPTION_KEY" usage:"Base64-encoded 32-byte AES-256 key for encrypting sensitive data (optional)"`
 
+	// Session & cookie lifetime / security (F5). Defaults reproduce the prior
+	// hardcoded behavior exactly.
+	CookieExpire   string `name:"cookie-expire" env:"COOKIE_EXPIRE" usage:"Access-token / access-cookie lifetime as a Go duration (e.g. 30m, 1h, 2h)" default:"1h"`
+	CookieRefresh  string `name:"cookie-refresh" env:"COOKIE_REFRESH" usage:"Refresh-token / refresh-cookie lifetime AND grant expiry as a Go duration (e.g. 720h)" default:"720h"`
+	CookieSecure   string `name:"cookie-secure" env:"COOKIE_SECURE" usage:"Cookie Secure attribute policy: 'auto' (Secure when request is HTTPS), 'true' (always), or 'false' (never)" default:"auto"`
+	CookieSameSite string `name:"cookie-samesite" env:"COOKIE_SAMESITE" usage:"Cookie SameSite attribute: 'lax' (default), 'strict', or 'none' ('none' requires COOKIE_SECURE=true)" default:"lax"`
+
 	// Server configuration
 	Port        string `name:"port" env:"PORT" usage:"Port to run the server on" default:"8080"`
 	Host        string `name:"host" env:"HOST" usage:"Host to bind the server to" default:"localhost"`
@@ -100,6 +107,11 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 
 		AuthorizationHeaderToken: c.AuthorizationHeaderToken,
 		IDTokenHeader:            c.IDTokenHeader,
+
+		CookieExpire:   c.CookieExpire,
+		CookieRefresh:  c.CookieRefresh,
+		CookieSecure:   c.CookieSecure,
+		CookieSameSite: c.CookieSameSite,
 	}
 
 	// Validate configuration
