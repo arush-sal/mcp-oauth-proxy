@@ -37,6 +37,55 @@ const (
 	forwardedNameHeader  = "X-Forwarded-Name"
 )
 
+// inboundIdentityHeaders is the canonical set of client-supplied identity /
+// forwarded headers stripped from the outbound request when
+// STRIP_INBOUND_IDENTITY_HEADERS is enabled (F3). The names mirror oauth2-proxy
+// so behavior is familiar. It deliberately EXCLUDES routing/transport headers
+// (X-Forwarded-Host, X-Forwarded-Proto, X-Forwarded-For, X-Forwarded-Uri):
+// those are not identity signals and the proxy Director sets Host/Proto itself.
+//
+// The proxy-managed four (X-Forwarded-User/Email/Name/Access-Token) and
+// Authorization are listed here for an explicit pre-strip, even though
+// setHeaders re-derives them afterward; this keeps the stripped set complete and
+// self-documenting. The runtime-configured ID_TOKEN_HEADER is added on top of
+// this list by stripInboundIdentityHeaders.
+var inboundIdentityHeaders = []string{
+	authorizationHeader,
+	forwardedUserHeader,
+	forwardedEmailHeader,
+	forwardedNameHeader,
+	accessTokenHeader,
+	"X-Forwarded-Groups",
+	"X-Forwarded-Preferred-Username",
+	"X-Forwarded-Preferred-User",
+	"X-Forwarded-Auth",
+	"X-Auth-Request-User",
+	"X-Auth-Request-Email",
+	"X-Auth-Request-Groups",
+	"X-Auth-Request-Preferred-Username",
+	"X-Auth-Request-Access-Token",
+	"X-Auth-Request-Authorization",
+	"X-Auth-Request-Redirect",
+	"X-Remote-User",
+	"X-Remote-Email",
+	"X-Remote-Groups",
+}
+
+// stripInboundIdentityHeaders deletes the full inbound identity / forwarded
+// header family (inboundIdentityHeaders) plus the configured ID_TOKEN_HEADER
+// from header. It is called from setHeaders BEFORE the proxy writes its own
+// derived headers, so legitimately-derived values are written after the strip.
+// A spoofed inbound value for any of these headers therefore cannot survive into
+// the upstream request.
+func (f forwardConfig) stripInboundIdentityHeaders(header http.Header) {
+	for _, h := range inboundIdentityHeaders {
+		header.Del(h)
+	}
+	if f.idTokenHeader != "" {
+		header.Del(f.idTokenHeader)
+	}
+}
+
 // forwardConfig is the resolved, validated upstream token-forwarding policy.
 // It is derived once at startup from types.Config so the per-request header
 // path does not re-parse strings. The zero value means "none": preserve

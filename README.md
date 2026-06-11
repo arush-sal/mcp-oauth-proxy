@@ -141,6 +141,7 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `ALLOWED_GOOGLE_HOSTED_DOMAINS` | ❌ | Comma-separated allowed Google hosted domains (`hd` claim)  |
 | `AUTHORIZATION_HEADER_TOKEN` | ❌ | Token to forward on the upstream `Authorization` header: `none` (default), `access_token`, or `id_token`. See "Forwarding the ID token to the upstream" |
 | `ID_TOKEN_HEADER`           | ❌ | Custom header to carry the raw verified id_token (no `Bearer ` prefix). When empty and forwarding the id_token, uses `Authorization: Bearer <id_token>` |
+| `STRIP_INBOUND_IDENTITY_HEADERS` | ❌ | Strip client-supplied identity / forwarded headers from the upstream request so a caller cannot spoof identity. Default `false`. See "Inbound header hygiene" |
 | `COOKIE_EXPIRE`             | ❌ | Access-token / access-cookie lifetime as a Go duration string (e.g. `30m`, `1h`, `2h`). Default `1h`. Must be positive. See "Session & cookie lifetime" |
 | `COOKIE_REFRESH`            | ❌ | Refresh-token / refresh-cookie lifetime **and** grant expiry, as a Go duration string (e.g. `720h`). Default `720h` (30 days). Must be positive |
 | `COOKIE_SECURE`             | ❌ | Cookie `Secure` attribute policy: `auto` (default; Secure when the request is HTTPS), `true` (always), or `false` (never) |
@@ -380,6 +381,53 @@ not issue a fresh id_token on refresh, forwarding stops** (the header is
 omitted) rather than sending an expired token. Request a refresh-capable
 id_token (e.g. include the `openid` scope and, where required by the provider,
 `access_type=offline`) if you rely on continuous id_token forwarding.
+
+## Inbound header hygiene
+
+An upstream MCP server may trust identity headers that the proxy does **not**
+otherwise manage (for example `X-Forwarded-Groups` or the oauth2-proxy
+`X-Auth-Request-*` family). Without protection, a client could set those headers
+on its request and have them pass straight through to the upstream, spoofing an
+identity the proxy never asserted.
+
+**Always neutralized (regardless of this setting).** The four proxy-managed
+identity headers — `X-Forwarded-User`, `X-Forwarded-Email`, `X-Forwarded-Name`,
+`X-Forwarded-Access-Token` — and `Authorization` are always re-derived from the
+verified session (set when a value is available, deleted otherwise), so an
+inbound spoofed value for any of these can never reach the upstream.
+
+**`STRIP_INBOUND_IDENTITY_HEADERS`** (default `false`) extends this protection
+to the broader identity/forwarded family. When `true`, the proxy DELETES the
+following inbound headers from the upstream request **before** writing its own
+derived headers, so legitimately-derived values are still sent afterward:
+
+- `Authorization`
+- `X-Forwarded-User`, `X-Forwarded-Email`, `X-Forwarded-Name`,
+  `X-Forwarded-Access-Token`
+- `X-Forwarded-Groups`, `X-Forwarded-Preferred-Username`,
+  `X-Forwarded-Preferred-User`, `X-Forwarded-Auth`
+- `X-Auth-Request-User`, `X-Auth-Request-Email`, `X-Auth-Request-Groups`,
+  `X-Auth-Request-Preferred-Username`, `X-Auth-Request-Access-Token`,
+  `X-Auth-Request-Authorization`, `X-Auth-Request-Redirect`
+- `X-Remote-User`, `X-Remote-Email`, `X-Remote-Groups` (nginx/Apache style)
+- the configured **`ID_TOKEN_HEADER`** (if set), so a spoofed inbound id_token
+  value cannot survive even when no valid id_token is forwarded
+
+Routing/transport headers (`X-Forwarded-Host`, `X-Forwarded-Proto`,
+`X-Forwarded-For`, `X-Forwarded-Uri`) are intentionally **not** stripped; the
+proxy sets `X-Forwarded-Host`/`X-Forwarded-Proto` itself.
+
+In **proxy** mode the strip is applied to the outbound request the proxy makes
+to the upstream, so a spoofed client header cannot reach the upstream. In
+**forward-auth** mode the proxy only controls the headers it writes onto its own
+auth-check response; sanitizing the original client request that the gateway
+(nginx, Caddy, etc.) ultimately forwards to the upstream is the **gateway's**
+responsibility — configure it to not pass client-supplied identity headers
+through.
+
+When `false` (the default), existing behavior is unchanged: only the four
+managed headers + `Authorization` are neutralized, and the broader family passes
+through.
 
 ## VSCode Setup
 
