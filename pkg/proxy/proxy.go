@@ -48,6 +48,7 @@ type OAuthProxy struct {
 	config          *types.Config
 	authorizer      *authz.Authorizer
 	idTokenVerifier callback.IDTokenVerifier
+	forwardCfg      forwardConfig
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -151,6 +152,14 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		log.Println("WARNING: no allowlist configured (ALLOWED_EMAILS / ALLOWED_EMAIL_DOMAINS / ALLOWED_GROUPS / ALLOWED_GOOGLE_HOSTED_DOMAINS): DENYING ALL users. Set ALLOWED_EMAIL_DOMAINS=* to allow any authenticated user.")
 	}
 
+	// Resolve and validate the upstream token-forwarding policy (F4f). Reject
+	// ambiguous or colliding configs at startup rather than silently picking a
+	// winner.
+	forwardCfg, err := resolveForwardConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("invalid token forwarding configuration: %w", err)
+	}
+
 	// Split and trim scopes to handle whitespace
 	scopesSupported := ParseScopesSupported(config.ScopesSupported)
 
@@ -182,6 +191,7 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		encryptionKey: encryptionKey,
 		config:        config,
 		authorizer:    authorizer,
+		forwardCfg:    forwardCfg,
 		ctx:           ctx,
 		cancel:        cancel,
 	}, nil
@@ -561,7 +571,7 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 	case ModeMiddleware:
 		next.ServeHTTP(w, r)
 	case ModeForwardAuth:
-		setHeaders(w.Header(), tokenInfo.Props)
+		p.setHeaders(w.Header(), tokenInfo.Props)
 	case ModeProxy:
 		// Create target URL
 		targetURL := p.GetMCPServerURL() + "/" + path
@@ -571,7 +581,6 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 		// Create reverse proxy
 		proxy := &httputil.ReverseProxy{
 			Director: func(req *http.Request) {
-				req.Header.Del("Authorization")
 				req.Header.Set("X-Forwarded-Host", req.Host)
 				req.Header.Set("X-Forwarded-Proto", req.URL.Scheme)
 
@@ -580,8 +589,11 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 				req.URL.Host = newURL.Host
 				req.Host = newURL.Host
 
-				// Add forwarded headers from token props
-				setHeaders(req.Header, tokenInfo.Props)
+				// Add forwarded headers from token props. setHeaders deletes any
+				// inbound Authorization first, then applies the configured
+				// forwarding policy, so a forwarded token (if any) is the final
+				// Authorization value.
+				p.setHeaders(req.Header, tokenInfo.Props)
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				// Rewrite Location header to use proxy host instead of downstream server host
@@ -615,7 +627,17 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 	}
 }
 
-func setHeaders(header http.Header, props map[string]any) {
+// setHeaders writes the X-Forwarded-* identity headers from the grant props and
+// then applies the resolved upstream token-forwarding policy (F4f).
+//
+// Any inbound Authorization is deleted FIRST so a spoofed value can never
+// survive into the upstream request, regardless of policy. The forwarding
+// policy then sets the Authorization (or the configured custom id_token header)
+// when configured to do so. This makes both call sites (the proxy Director and
+// forward_auth mode) consistent and spoof-safe.
+func (p *OAuthProxy) setHeaders(header http.Header, props map[string]any) {
+	header.Del(authorizationHeader)
+
 	if userID, ok := props["user_id"].(string); ok {
 		header.Set("X-Forwarded-User", userID)
 	} else {
@@ -636,6 +658,10 @@ func setHeaders(header http.Header, props map[string]any) {
 	} else {
 		header.Del("X-Forwarded-Access-Token")
 	}
+
+	// Apply the configured upstream auth header(s) AFTER deleting any inbound
+	// Authorization, so forwarding writes the final value.
+	p.forwardCfg.applyForwarding(header, props)
 }
 
 // reauthorizeOnRefresh re-derives the user's identity after an IdP token refresh

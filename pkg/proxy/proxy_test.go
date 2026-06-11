@@ -155,7 +155,19 @@ func TestLoadConfigFromEnv(t *testing.T) {
 	})
 }
 
+// newNoneProxy builds a proxy with the default ("none") forwarding policy for
+// exercising setHeaders without enabling any token forwarding.
+func newNoneProxy(t *testing.T) *OAuthProxy {
+	t.Helper()
+	p, err := NewOAuthProxy(&types.Config{Mode: ModeForwardAuth})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	return p
+}
+
 func TestSetHeaders(t *testing.T) {
+	p := newNoneProxy(t)
+	setHeaders := p.setHeaders
 	t.Run("AllProperties", func(t *testing.T) {
 		header := make(http.Header)
 		props := map[string]any{
@@ -462,6 +474,7 @@ func TestModeSpecificValidation(t *testing.T) {
 
 // TestHeaderOverwriting tests that headers are properly overwritten
 func TestHeaderOverwriting(t *testing.T) {
+	setHeaders := newNoneProxy(t).setHeaders
 	header := make(http.Header)
 
 	// Set initial headers
@@ -485,6 +498,7 @@ func TestHeaderOverwriting(t *testing.T) {
 
 // TestSpecialCharactersInHeaders tests handling of special characters
 func TestSpecialCharactersInHeaders(t *testing.T) {
+	setHeaders := newNoneProxy(t).setHeaders
 	header := make(http.Header)
 	props := map[string]any{
 		"user_id":      "user@domain.com",
@@ -503,6 +517,10 @@ func TestSpecialCharactersInHeaders(t *testing.T) {
 
 // BenchmarkSetHeaders benchmarks the header setting function
 func BenchmarkSetHeaders(t *testing.B) {
+	p, err := NewOAuthProxy(&types.Config{Mode: ModeForwardAuth})
+	require.NoError(t, err)
+	defer func() { _ = p.Close() }()
+	setHeaders := p.setHeaders
 	header := make(http.Header)
 	props := map[string]any{
 		"user_id":      "user123",

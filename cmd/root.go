@@ -39,6 +39,11 @@ type RootCmd struct {
 	GroupsClaim                string `name:"groups-claim" env:"GROUPS_CLAIM" usage:"id_token claim that carries the user's groups" default:"groups"`
 	AllowedGoogleHostedDomains string `name:"allowed-google-hosted-domains" env:"ALLOWED_GOOGLE_HOSTED_DOMAINS" usage:"Comma-separated list of allowed Google hosted domains (checked against the 'hd' claim)"`
 
+	// Upstream token forwarding (F4f). Forward the verified id_token (or the
+	// access token) to the upstream MCP server. Default: forward nothing.
+	AuthorizationHeaderToken string `name:"authorization-header-token" env:"AUTHORIZATION_HEADER_TOKEN" usage:"Which token to place on the upstream Authorization header: 'none' (default), 'access_token', or 'id_token'" default:"none"`
+	IDTokenHeader            string `name:"id-token-header" env:"ID_TOKEN_HEADER" usage:"Optional custom header to carry the raw verified id_token (no 'Bearer ' prefix). When empty and forwarding id_token, uses 'Authorization: Bearer <id_token>'"`
+
 	// Scopes and MCP configuration
 	ScopesSupported string `name:"scopes-supported" env:"SCOPES_SUPPORTED" usage:"Comma-separated list of supported OAuth scopes (e.g., 'openid,profile,email')" required:"true"`
 	MCPServerURL    string `name:"mcp-server-url" env:"MCP_SERVER_URL" usage:"URL of the MCP server to proxy requests to" required:"true"`
@@ -92,6 +97,9 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		AllowedGroups:              parseCommaList(c.AllowedGroups),
 		GroupsClaim:                c.GroupsClaim,
 		AllowedGoogleHostedDomains: parseCommaList(c.AllowedGoogleHostedDomains),
+
+		AuthorizationHeaderToken: c.AuthorizationHeaderToken,
+		IDTokenHeader:            c.IDTokenHeader,
 	}
 
 	// Validate configuration

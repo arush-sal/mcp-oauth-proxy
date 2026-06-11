@@ -139,6 +139,8 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `ALLOWED_GROUPS`            | ❌ | Comma-separated allowed groups                                   |
 | `GROUPS_CLAIM`              | ❌ | id_token claim carrying groups (default `groups`)                |
 | `ALLOWED_GOOGLE_HOSTED_DOMAINS` | ❌ | Comma-separated allowed Google hosted domains (`hd` claim)  |
+| `AUTHORIZATION_HEADER_TOKEN` | ❌ | Token to forward on the upstream `Authorization` header: `none` (default), `access_token`, or `id_token`. See "Forwarding the ID token to the upstream" |
+| `ID_TOKEN_HEADER`           | ❌ | Custom header to carry the raw verified id_token (no `Bearer ` prefix). When empty and forwarding the id_token, uses `Authorization: Bearer <id_token>` |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
 
@@ -221,6 +223,56 @@ export ALLOWED_EMAILS="alice@example.com,bob@example.com"
 - Google: `https://accounts.google.com`
 - Microsoft: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize`
 - GitHub: `https://github.com/login/oauth/authorize`
+
+## Forwarding the ID token to the upstream
+
+By default the proxy forwards nothing on the upstream `Authorization` header:
+the inbound `Authorization` is stripped and the OAuth access token is exposed
+only via `X-Forwarded-Access-Token`. Some upstreams want to validate the
+**verified OIDC id_token** themselves (for example Grafana's `[auth.jwt]`,
+which validates a JWT against the IdP's JWKS). Two settings enable this:
+
+- **`AUTHORIZATION_HEADER_TOKEN`** — `none` (default), `access_token`, or
+  `id_token`.
+  - `none`: current behavior. No `Authorization` is set on the upstream
+    request.
+  - `access_token`: sets `Authorization: Bearer <access_token>`.
+    `X-Forwarded-Access-Token` is still sent as before.
+  - `id_token`: forwards the verified id_token. With no custom header it is
+    sent as `Authorization: Bearer <id_token>`.
+- **`ID_TOKEN_HEADER`** — optional custom header that carries the **raw**
+  id_token (a bare JWT, **no `Bearer ` prefix**), e.g.
+  `ID_TOKEN_HEADER=X-Id-Token`. The `Authorization` header always uses the
+  `Bearer ` prefix; only custom headers carry the bare JWT.
+
+Example (Grafana validating the id_token via `[auth.jwt]`):
+
+```bash
+export OAUTH_JWKS_URL="https://accounts.google.com/.well-known/openid-configuration/jwks"
+export AUTHORIZATION_HEADER_TOKEN="id_token"
+# or send it on a dedicated header instead of Authorization:
+# export ID_TOKEN_HEADER="X-Id-Token"
+```
+
+**Startup validation (no silent "one wins").** The proxy refuses to start when
+two directives target the same header:
+
+- `AUTHORIZATION_HEADER_TOKEN=id_token` together with a non-empty
+  `ID_TOKEN_HEADER` (two directives for the id_token destination — use one).
+- `ID_TOKEN_HEADER` resolving to `Authorization` while
+  `AUTHORIZATION_HEADER_TOKEN=access_token` (both land on `Authorization`).
+- `ID_TOKEN_HEADER` resolving to `X-Forwarded-Access-Token` (collides with the
+  proxy's access-token header).
+- Any `AUTHORIZATION_HEADER_TOKEN` value outside `none|access_token|id_token`.
+
+**Staleness / refresh caveat.** id_tokens are short-lived. Before forwarding,
+the proxy checks the stored id_token's `exp` and **never forwards a stale (or
+absent) token** — the header is simply omitted. On an IdP token refresh the
+proxy re-verifies and updates the stored id_token; however, **if the IdP does
+not issue a fresh id_token on refresh, forwarding stops** (the header is
+omitted) rather than sending an expired token. Request a refresh-capable
+id_token (e.g. include the `openid` scope and, where required by the provider,
+`access_type=offline`) if you rely on continuous id_token forwarding.
 
 ## VSCode Setup
 
