@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
@@ -386,6 +387,17 @@ func (d *Store) CleanupExpiredAuthRequests() error {
 		fmt.Printf("Deleted %d expired auth requests\n", result.RowsAffected)
 	}
 	return nil
+}
+
+// Ping verifies connectivity to the underlying database. It is used by the
+// readiness probe to report whether the proxy's critical dependency (its data
+// store) is reachable. A nil error means the database answered the ping.
+func (d *Store) Ping(ctx context.Context) error {
+	sqlDB, err := d.db.DB()
+	if err != nil {
+		return fmt.Errorf("failed to access underlying database: %w", err)
+	}
+	return sqlDB.PingContext(ctx)
 }
 
 // Close closes the database connection

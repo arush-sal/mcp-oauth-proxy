@@ -1,6 +1,8 @@
 package types
 
 import (
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -73,6 +75,110 @@ type Config struct {
 	CookieRefresh  string
 	CookieSecure   string
 	CookieSameSite string
+
+	// Health & metrics endpoints (F6). Kubernetes-style liveness/readiness
+	// probes plus optional Prometheus metrics. Defaults preserve existing
+	// behavior: probes are always on at root paths, metrics are off.
+	//
+	// HealthPath is the liveness path (default "/healthz"); it returns 200
+	// unconditionally. ReadyPath is the readiness path (default "/readyz"); it
+	// checks the DB and returns 200/503. The legacy "/health" route remains an
+	// alias of liveness for back-compat. EnableMetrics turns on a Prometheus
+	// handler. MetricsPath is its path (default "/metrics"). MetricsAddress,
+	// when non-empty (e.g. ":9090"), serves metrics on a SEPARATE listener at
+	// that address instead of the main mux; when empty and EnableMetrics is
+	// true, metrics are mounted on the main mux at MetricsPath.
+	HealthPath     string
+	ReadyPath      string
+	EnableMetrics  bool
+	MetricsPath    string
+	MetricsAddress string
+}
+
+// HealthMetricsConfig is the resolved health/metrics policy derived from the
+// raw Config fields. It centralizes default resolution and the "where do
+// metrics live" decision so both the route wiring and the cmd-layer listener
+// startup agree without duplicating logic.
+type HealthMetricsConfig struct {
+	HealthPath     string
+	ReadyPath      string
+	EnableMetrics  bool
+	MetricsPath    string
+	MetricsAddress string
+}
+
+// MetricsOnMainMux reports whether the metrics handler should be registered on
+// the main server mux. This is true only when metrics are enabled AND no
+// separate MetricsAddress is configured.
+func (h HealthMetricsConfig) MetricsOnMainMux() bool {
+	return h.EnableMetrics && h.MetricsAddress == ""
+}
+
+// MetricsOnSeparateListener reports whether a dedicated metrics listener should
+// be started. This is true only when metrics are enabled AND a MetricsAddress
+// is configured.
+func (h HealthMetricsConfig) MetricsOnSeparateListener() bool {
+	return h.EnableMetrics && h.MetricsAddress != ""
+}
+
+// ResolveHealthMetricsConfig applies defaults to the raw health/metrics config
+// fields. Empty paths fall back to the Kubernetes-style defaults. It never
+// errors: all combinations are valid (the empty-vs-set MetricsAddress decision
+// is expressed through the MetricsOn* helpers).
+func ResolveHealthMetricsConfig(c *Config) HealthMetricsConfig {
+	h := HealthMetricsConfig{
+		HealthPath:     c.HealthPath,
+		ReadyPath:      c.ReadyPath,
+		EnableMetrics:  c.EnableMetrics,
+		MetricsPath:    c.MetricsPath,
+		MetricsAddress: c.MetricsAddress,
+	}
+	if h.HealthPath == "" {
+		h.HealthPath = "/healthz"
+	}
+	if h.ReadyPath == "" {
+		h.ReadyPath = "/readyz"
+	}
+	if h.MetricsPath == "" {
+		h.MetricsPath = "/metrics"
+	}
+	return h
+}
+
+// Validate checks the resolved health/metrics policy for path collisions and
+// malformed paths that would otherwise panic http.ServeMux at route setup.
+// Call it on the result of ResolveHealthMetricsConfig so defaults are already
+// applied. It enforces:
+//   - HealthPath, ReadyPath (and MetricsPath when metrics are enabled) must be
+//     absolute paths beginning with "/".
+//   - HealthPath != ReadyPath (both always register on the main mux).
+//   - When metrics share the main mux (EnableMetrics && MetricsAddress==""),
+//     MetricsPath must not collide with HealthPath or ReadyPath. On a separate
+//     listener the metrics path lives on its own mux, so a collision is allowed.
+func (h HealthMetricsConfig) Validate() error {
+	if !strings.HasPrefix(h.HealthPath, "/") {
+		return fmt.Errorf("health path %q must be an absolute path starting with %q", h.HealthPath, "/")
+	}
+	if !strings.HasPrefix(h.ReadyPath, "/") {
+		return fmt.Errorf("ready path %q must be an absolute path starting with %q", h.ReadyPath, "/")
+	}
+	if h.HealthPath == h.ReadyPath {
+		return fmt.Errorf("health path and ready path must differ (both set to %q)", h.HealthPath)
+	}
+	if h.EnableMetrics {
+		if !strings.HasPrefix(h.MetricsPath, "/") {
+			return fmt.Errorf("metrics path %q must be an absolute path starting with %q", h.MetricsPath, "/")
+		}
+		if h.MetricsOnMainMux() {
+			if h.MetricsPath == h.HealthPath {
+				return fmt.Errorf("metrics path %q collides with health path on the main mux", h.MetricsPath)
+			}
+			if h.MetricsPath == h.ReadyPath {
+				return fmt.Errorf("metrics path %q collides with ready path on the main mux", h.MetricsPath)
+			}
+		}
+	}
+	return nil
 }
 
 // TokenData represents stored token data for OAuth 2.1 compliance

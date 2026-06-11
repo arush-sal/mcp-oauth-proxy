@@ -145,6 +145,11 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `COOKIE_REFRESH`            | ❌ | Refresh-token / refresh-cookie lifetime **and** grant expiry, as a Go duration string (e.g. `720h`). Default `720h` (30 days). Must be positive |
 | `COOKIE_SECURE`             | ❌ | Cookie `Secure` attribute policy: `auto` (default; Secure when the request is HTTPS), `true` (always), or `false` (never) |
 | `COOKIE_SAMESITE`           | ❌ | Cookie `SameSite` attribute: `lax` (default), `strict`, or `none`. `none` requires `COOKIE_SECURE=true` |
+| `HEALTH_PATH`               | ❌ | Liveness probe path. Default `/healthz`. Returns 200 unconditionally. See "Health & metrics" |
+| `READY_PATH`                | ❌ | Readiness probe path. Default `/readyz`. Returns 200 when the database is reachable, 503 otherwise |
+| `ENABLE_METRICS`            | ❌ | Enable the Prometheus metrics endpoint. Default `false` |
+| `METRICS_PATH`              | ❌ | Path for the Prometheus metrics endpoint. Default `/metrics` |
+| `METRICS_ADDRESS`           | ❌ | When set (e.g. `:9090`), serve metrics on a **separate** listener at this address instead of the main server. When empty and `ENABLE_METRICS=true`, metrics are served on the main server at `METRICS_PATH` |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
 
@@ -178,6 +183,55 @@ need no changes.
 > `SameSite=None` cookies that are not also `Secure`, so this combination is
 > rejected at startup with a clear error. (`auto` is not sufficient because it
 > cannot guarantee the cookie is always marked `Secure`.)
+
+### Health & metrics
+
+Kubernetes-style health probes and optional Prometheus metrics. **The defaults
+preserve existing behavior**, so deployments need no changes: the probes are
+always on, metrics are off, and the legacy `/health` route keeps working.
+
+**Liveness vs readiness**
+
+- **Liveness** (`HEALTH_PATH`, default `/healthz`) returns `200` with
+  `{"status":"ok"}` unconditionally. It performs **no** dependency checks — it
+  only reports that the process is up and serving. Use it for the Kubernetes
+  liveness probe.
+- **Readiness** (`READY_PATH`, default `/readyz`) checks the proxy's critical
+  dependency (a database ping with a short timeout). It returns `200` when the
+  database is reachable and `503` with a small JSON body when it is not. Use it
+  for the Kubernetes readiness probe so traffic is only routed once the data
+  store is reachable.
+
+The probe endpoints are registered at the **root** (never under `ROUTE_PREFIX`,
+mirroring the `.well-known/*` metadata) so probe paths stay stable, and they are
+**unauthenticated** and not rate-limited so probes always succeed. They use
+exact paths and therefore never fall into the catch-all proxy route.
+
+> [!NOTE]
+> The legacy `/health` route is kept as a **back-compat alias of liveness** and
+> still returns `200` with `{"status":"ok"}`. Unlike the new probes, `/health`
+> remains mounted under `ROUTE_PREFIX` (its historical behavior). Prefer
+> `HEALTH_PATH`/`READY_PATH` for new deployments.
+
+**Metrics**
+
+- Set `ENABLE_METRICS=true` to expose Prometheus metrics. Metrics use a private
+  (non-default) registry so multiple instances do not collide.
+- When `METRICS_ADDRESS` is **empty**, metrics are served on the **main server**
+  at `METRICS_PATH` (default `/metrics`).
+- When `METRICS_ADDRESS` is **set** (e.g. `:9090`), metrics are served on a
+  **separate listener** at that address and `METRICS_PATH`, and are **not**
+  mounted on the main server. The separate listener shuts down gracefully
+  alongside the main server on `SIGINT`/`SIGTERM`.
+- When `ENABLE_METRICS=false` (default), no metrics endpoint is mounted and no
+  second listener is started.
+
+Exposed metric names:
+
+- `http_requests_total{code,method}` — total HTTP requests by response code and
+  method.
+- `http_request_duration_seconds{method}` — request latency histogram by method.
+- Standard `go_*` and `process_*` runtime/process collectors.
 
 ## Authorization / Allowlist
 
