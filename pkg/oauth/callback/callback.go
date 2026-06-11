@@ -1,6 +1,7 @@
 package callback
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/idtoken"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 )
@@ -23,6 +25,14 @@ type Store interface {
 	StoreToken(token *types.TokenData) error
 }
 
+// IDTokenVerifier verifies an IdP-issued OIDC id_token and returns its
+// normalized claims. *idtoken.Verifier satisfies this interface. It is kept as
+// an interface so the verifier is optional (a nil verifier disables id_token
+// verification) and so the handler can be tested in isolation.
+type IDTokenVerifier interface {
+	Verify(ctx context.Context, rawIDToken string) (*idtoken.Claims, error)
+}
+
 type Handler struct {
 	db               Store
 	provider         providers.Provider
@@ -31,6 +41,10 @@ type Handler struct {
 	clientSecret     string
 	routePrefix      string
 	cookieNamePrefix string
+	// idTokenVerifier is optional. When nil, the IdP id_token (if any) is not
+	// verified and no id_token claims are stored, which is the behavior-neutral
+	// default for non-OIDC setups.
+	idTokenVerifier IDTokenVerifier
 }
 
 // MCPUIManager interface for generating JWT tokens
@@ -38,7 +52,7 @@ type MCPUIManager interface {
 	GenerateMCPUICodeForDownstream(bearerToken, refreshToken string) (string, error)
 }
 
-func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string) http.Handler {
+func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier) http.Handler {
 	return &Handler{
 		db:               db,
 		provider:         provider,
@@ -47,7 +61,38 @@ func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, cli
 		clientSecret:     clientSecret,
 		routePrefix:      routePrefix,
 		cookieNamePrefix: cookieNamePrefix,
+		idTokenVerifier:  idTokenVerifier,
 	}
+}
+
+// idTokenExtractor is satisfied by *oauth2.Token; it exposes the raw id_token
+// stored in the token's extra fields by the OIDC token endpoint.
+type idTokenExtractor interface {
+	Extra(key string) any
+}
+
+// verifyIDToken pulls the raw id_token out of the token-exchange result and, if
+// present and a verifier is configured, verifies it and returns the normalized
+// claims plus the raw token. Behavior:
+//   - no verifier configured (non-OIDC setup): returns (nil, "", nil)
+//   - no id_token present: returns (nil, "", nil)
+//   - id_token present but invalid: returns (nil, "", err) -> caller rejects
+//   - id_token present and valid: returns (claims, rawIDToken, nil)
+func (p *Handler) verifyIDToken(ctx context.Context, tok idTokenExtractor) (*idtoken.Claims, string, error) {
+	if p.idTokenVerifier == nil || tok == nil {
+		return nil, "", nil
+	}
+
+	rawIDToken, _ := tok.Extra("id_token").(string)
+	if rawIDToken == "" {
+		return nil, "", nil
+	}
+
+	claims, err := p.idTokenVerifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		return nil, "", err
+	}
+	return claims, rawIDToken, nil
 }
 
 // scopeContainsProfileOrEmail checks if the given scopes contain profile or email
@@ -194,6 +239,22 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// If the IdP returned an OIDC id_token and an id_token verifier is
+	// configured, verify it and capture normalized claims for storage. This is
+	// behavior-neutral: claims are only stored, never forwarded or used to gate
+	// the request here. If no id_token is present, we proceed unchanged with
+	// empty claims. If verification FAILS, we reject the login rather than
+	// silently proceeding with an unverified token.
+	idTokenClaims, rawIDToken, err := p.verifyIDToken(r.Context(), tokenInfo)
+	if err != nil {
+		log.Printf("Failed to verify id_token: %v", err)
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "Failed to verify identity token",
+		})
+		return
+	}
+
 	// Create a grant for this user
 	grantID := encryption.GenerateRandomString(16)
 	now := time.Now().Unix()
@@ -203,6 +264,23 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"access_token":  tokenInfo.AccessToken,
 		"refresh_token": tokenInfo.RefreshToken,
 		"expires_at":    tokenInfo.Expiry.Unix(),
+	}
+
+	// Store verified id_token claims (and the raw token) so a later feature can
+	// authorize on them. Only present when an id_token was returned and a
+	// verifier is configured.
+	if idTokenClaims != nil {
+		claimsJSON, marshalErr := json.Marshal(idTokenClaims)
+		if marshalErr != nil {
+			log.Printf("Failed to marshal id_token claims: %v", marshalErr)
+			handlerutils.JSON(w, http.StatusInternalServerError, types.OAuthError{
+				Error:            "server_error",
+				ErrorDescription: "Failed to process identity token",
+			})
+			return
+		}
+		sensitiveProps["id_token_claims"] = string(claimsJSON)
+		sensitiveProps["id_token"] = rawIDToken
 	}
 
 	// Only add user info if we have it
@@ -299,7 +377,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			UserID:                userInfo.ID,
 			GrantID:               grantID,
 			Scope:                 authReq.Scope,
-			ExpiresAt:             time.Now().Add(time.Hour),        // 1 hour for access token
+			ExpiresAt:             time.Now().Add(time.Hour),           // 1 hour for access token
 			RefreshTokenExpiresAt: time.Now().Add(30 * 24 * time.Hour), // 30 days for refresh token
 			CreatedAt:             time.Now(),
 			Revoked:               false,

@@ -18,6 +18,7 @@ import (
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/db"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/idtoken"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/oauth/authorize"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/oauth/callback"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/oauth/register"
@@ -146,6 +147,50 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 	}, nil
 }
 
+// buildIDTokenVerifier constructs the OIDC id_token verifier from the provider
+// parameters in config: the issuer is derived from the OAuth authorize URL
+// origin, the JWKS URL comes from config, and the expected audience is the
+// OAuth client ID. It returns a true nil interface (not a typed nil) when the
+// verifier cannot or should not be built, so the callback treats it as "no
+// id_token verification". This keeps startup working for non-OIDC setups (no
+// JWKS URL) and degrades gracefully if the verifier cannot be constructed.
+func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
+	issuer := oidcIssuerFromAuthorizeURL(p.config.OAuthAuthorizeURL)
+
+	verifier, err := idtoken.MaybeNewVerifier(context.Background(), idtoken.Config{
+		Issuer:   issuer,
+		JWKSURL:  p.config.OAuthJWKSURL,
+		Audience: p.config.OAuthClientID,
+	})
+	if err != nil {
+		// The parameters were present but the verifier could not be built
+		// (e.g. JWKS endpoint unreachable at startup). Degrade to "no id_token
+		// verification" rather than failing startup.
+		log.Printf("id_token verifier not configured: %v", err)
+		return nil
+	}
+	if verifier == nil {
+		// Non-OIDC setup (missing issuer/JWKS/client ID): no verification.
+		return nil
+	}
+	return verifier
+}
+
+// oidcIssuerFromAuthorizeURL derives the expected id_token issuer ("iss") from
+// the OAuth authorize URL by taking its scheme://host origin. Most OIDC
+// providers (e.g. Google's https://accounts.google.com) issue id_tokens whose
+// "iss" equals this origin.
+func oidcIssuerFromAuthorizeURL(authorizeURL string) string {
+	if authorizeURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(authorizeURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+}
+
 // GetOAuthClientID returns the OAuth client ID from config
 func (p *OAuthProxy) GetOAuthClientID() string {
 	return p.config.OAuthClientID
@@ -206,9 +251,17 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 		p.config.CookieNamePrefix += "_"
 	}
 
+	// Build the OIDC id_token verifier from the provider's OIDC parameters.
+	// This is shared infra (V0): when the IdP issues an id_token it is verified
+	// and its claims are stored in the grant for later authorization features.
+	// The verifier is optional - buildIDTokenVerifier returns nil for non-OIDC
+	// setups (no JWKS URL configured) so the callback simply skips id_token
+	// verification rather than failing.
+	idTokenVerifier := p.buildIDTokenVerifier()
+
 	authorizeHandler := authorize.NewHandler(p.db, provider, p.metadata.ScopesSupported, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix)
 	tokenHandler := token.NewHandler(p.db)
-	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix)
+	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, idTokenVerifier)
 	revokeHandler := revoke.NewHandler(p.db)
 	tokenValidator := validate.NewTokenValidator(p.tokenManager, p.encryptionKey, p.db, provider, p.config.RoutePrefix, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.CookieNamePrefix, p.config.MCPServerID, p.metadata.ScopesSupported, p.config.MCPPaths)
 	successHandler := success.NewHandler()

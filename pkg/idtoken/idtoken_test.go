@@ -1,0 +1,258 @@
+package idtoken
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"encoding/base64"
+	"encoding/json"
+	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	testIssuer   = "https://idp.example.com"
+	testAudience = "test-client-id"
+	testKID      = "test-key-1"
+)
+
+// newTestKey generates an RSA key pair for signing test id_tokens.
+func newTestKey(t *testing.T) *rsa.PrivateKey {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	return key
+}
+
+// jwksJSON builds a minimal JWKS document exposing the public half of key.
+func jwksJSON(t *testing.T, key *rsa.PrivateKey, kid string) []byte {
+	t.Helper()
+	pub := key.Public().(*rsa.PublicKey)
+	n := base64.RawURLEncoding.EncodeToString(pub.N.Bytes())
+	eBytes := big.NewInt(int64(pub.E)).Bytes()
+	e := base64.RawURLEncoding.EncodeToString(eBytes)
+	doc := map[string]any{
+		"keys": []map[string]any{
+			{
+				"kty": "RSA",
+				"use": "sig",
+				"alg": "RS256",
+				"kid": kid,
+				"n":   n,
+				"e":   e,
+			},
+		},
+	}
+	b, err := json.Marshal(doc)
+	require.NoError(t, err)
+	return b
+}
+
+// jwksServer serves the JWKS document over HTTP for the verifier to fetch.
+func jwksServer(t *testing.T, key *rsa.PrivateKey, kid string) *httptest.Server {
+	t.Helper()
+	body := jwksJSON(t, key, kid)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// signToken signs claims into a JWT using key and the given kid/alg.
+func signToken(t *testing.T, key *rsa.PrivateKey, kid string, method jwt.SigningMethod, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(method, claims)
+	tok.Header["kid"] = kid
+	signed, err := tok.SignedString(key)
+	require.NoError(t, err)
+	return signed
+}
+
+func baseClaims() jwt.MapClaims {
+	now := time.Now()
+	return jwt.MapClaims{
+		"iss":            testIssuer,
+		"aud":            testAudience,
+		"sub":            "user-123",
+		"exp":            now.Add(time.Hour).Unix(),
+		"iat":            now.Unix(),
+		"email":          "user@example.com",
+		"email_verified": true,
+	}
+}
+
+func newTestVerifier(t *testing.T, jwksURL string) *Verifier {
+	t.Helper()
+	v, err := NewVerifier(context.Background(), Config{
+		Issuer:   testIssuer,
+		JWKSURL:  jwksURL,
+		Audience: testAudience,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, v)
+	return v
+}
+
+func TestVerify_ValidToken(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, baseClaims())
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	require.NotNil(t, claims)
+	assert.Equal(t, "user@example.com", claims.Email)
+	assert.True(t, claims.EmailVerified)
+	assert.Equal(t, "user-123", claims.Subject)
+	assert.Empty(t, claims.Groups)
+	assert.Empty(t, claims.HostedDomain)
+}
+
+func TestVerify_WrongAudience(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["aud"] = "some-other-client"
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_WrongIssuer(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["iss"] = "https://evil.example.com"
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_Expired(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["exp"] = time.Now().Add(-time.Hour).Unix()
+	c["iat"] = time.Now().Add(-2 * time.Hour).Unix()
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_BadSignature(t *testing.T) {
+	signingKey := newTestKey(t)
+	otherKey := newTestKey(t)
+	// JWKS advertises otherKey's public half under testKID, but the token is
+	// signed with signingKey, so signature verification must fail.
+	srv := jwksServer(t, otherKey, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	raw := signToken(t, signingKey, testKID, jwt.SigningMethodRS256, baseClaims())
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_GroupsAsArray(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["groups"] = []string{"a", "b"}
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, claims.Groups)
+}
+
+func TestVerify_GroupsAsString(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["groups"] = "a"
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a"}, claims.Groups)
+}
+
+func TestVerify_HostedDomain(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["hd"] = "example.com"
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, "example.com", claims.HostedDomain)
+}
+
+func TestVerify_MissingOptionalClaims(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, baseClaims())
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Empty(t, claims.Groups)
+	assert.Empty(t, claims.HostedDomain)
+}
+
+func TestVerify_EmptyTokenIsError(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	_, err := v.Verify(context.Background(), "")
+	require.Error(t, err)
+}
+
+func TestClaims_UnmarshalGroups(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{name: "array", raw: `{"groups":["a","b"]}`, want: []string{"a", "b"}},
+		{name: "string", raw: `{"groups":"a"}`, want: []string{"a"}},
+		{name: "absent", raw: `{}`, want: nil},
+		{name: "empty string", raw: `{"groups":""}`, want: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var c Claims
+			require.NoError(t, json.Unmarshal([]byte(tc.raw), &c))
+			assert.Equal(t, tc.want, c.Groups)
+		})
+	}
+}
