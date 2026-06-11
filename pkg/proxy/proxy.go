@@ -542,10 +542,10 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 					refreshToken, ok := tokenInfo.Props["refresh_token"].(string)
 					if !ok || refreshToken == "" {
 						log.Printf("No refresh token available, cannot refresh access token")
-						handlerutils.JSON(w, http.StatusUnauthorized, map[string]string{
-							"error":             "invalid_token",
-							"error_description": "Access token expired and no refresh token available",
-						})
+						// Agent re-auth challenge (F7): a bare 401 here would leave an
+						// MCP agent unable to re-run discovery. Emit the shared
+						// WWW-Authenticate challenge so it can re-authenticate.
+						handlerutils.WriteBearerChallenge(w, r, "Access token expired and no refresh token available")
 						return
 					}
 
@@ -576,10 +576,10 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 					newTokenInfo, err := provider.RefreshToken(r.Context(), refreshToken, clientID, clientSecret)
 					if err != nil {
 						log.Printf("Failed to refresh token: %v", err)
-						handlerutils.JSON(w, http.StatusUnauthorized, map[string]string{
-							"error":             "invalid_token",
-							"error_description": "Failed to refresh access token",
-						})
+						// Agent re-auth challenge (F7): the upstream refresh was
+						// rejected. Return 401 WITH the challenge (never a 500, never a
+						// bare 401) so the agent re-runs discovery / PKCE.
+						handlerutils.WriteBearerChallenge(w, r, "Failed to refresh access token")
 						return
 					}
 
@@ -602,10 +602,11 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 						} else {
 							log.Printf("authorization re-check failed on refresh for user=%q (session preserved): %v", tokenInfo.UserID, denied)
 						}
-						handlerutils.JSON(w, http.StatusUnauthorized, map[string]string{
-							"error":             "invalid_token",
-							"error_description": "Access revoked: you are no longer authorized to use this resource",
-						})
+						// Agent re-auth challenge (F7): the session revoke above (on a
+						// genuine deny) precedes this write. Emit 401 WITH the challenge
+						// (not a bare 401) so the de-authorized agent can re-run
+						// discovery; the revoked session forces a fresh authorization.
+						handlerutils.WriteBearerChallenge(w, r, "Access revoked: you are no longer authorized to use this resource")
 						return
 					}
 					tokenInfo.Props = refreshedProps
