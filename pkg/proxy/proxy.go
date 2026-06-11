@@ -404,7 +404,7 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	mux.HandleFunc("GET "+prefix+"/callback", p.withCORS(p.withRateLimit(callbackHandler)))
 	mux.HandleFunc("POST "+prefix+"/token", p.withCORS(p.withRateLimit(tokenHandler)))
 	mux.HandleFunc("POST "+prefix+"/revoke", p.withCORS(p.withRateLimit(revokeHandler)))
-	mux.HandleFunc("POST "+prefix+"/register", p.withCORS(p.withRateLimit(register.NewHandler(p.db))))
+	mux.HandleFunc("POST "+prefix+"/register", p.withCORS(p.withRateLimit(register.NewHandler(p.db, p.config.DCREnabled()))))
 
 	// Metadata endpoints
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", p.withCORS(p.oauthMetadataHandler))
@@ -485,19 +485,25 @@ func (p *OAuthProxy) oauthMetadataHandler(w http.ResponseWriter, r *http.Request
 
 	// Create dynamic metadata based on the request
 	metadata := &types.OAuthMetadata{
-		Issuer:                                   baseURL,
-		ServiceDocumentation:                     p.metadata.ServiceDocumentation,
-		AuthorizationEndpoint:                    fmt.Sprintf("%s%s/authorize", baseURL, prefix),
-		ResponseTypesSupported:                   p.metadata.ResponseTypesSupported,
-		CodeChallengeMethodsSupported:            p.metadata.CodeChallengeMethodsSupported,
-		TokenEndpoint:                            fmt.Sprintf("%s%s/token", baseURL, prefix),
-		TokenEndpointAuthMethodsSupported:        p.metadata.TokenEndpointAuthMethodsSupported,
-		GrantTypesSupported:                      p.metadata.GrantTypesSupported,
-		ScopesSupported:                          p.metadata.ScopesSupported,
-		RevocationEndpoint:                       fmt.Sprintf("%s%s/revoke", baseURL, prefix),
-		RevocationEndpointAuthMethodsSupported:   p.metadata.RevocationEndpointAuthMethodsSupported,
-		RegistrationEndpoint:                     fmt.Sprintf("%s%s/register", baseURL, prefix),
-		RegistrationEndpointAuthMethodsSupported: p.metadata.RegistrationEndpointAuthMethodsSupported,
+		Issuer:                                 baseURL,
+		ServiceDocumentation:                   p.metadata.ServiceDocumentation,
+		AuthorizationEndpoint:                  fmt.Sprintf("%s%s/authorize", baseURL, prefix),
+		ResponseTypesSupported:                 p.metadata.ResponseTypesSupported,
+		CodeChallengeMethodsSupported:          p.metadata.CodeChallengeMethodsSupported,
+		TokenEndpoint:                          fmt.Sprintf("%s%s/token", baseURL, prefix),
+		TokenEndpointAuthMethodsSupported:      p.metadata.TokenEndpointAuthMethodsSupported,
+		GrantTypesSupported:                    p.metadata.GrantTypesSupported,
+		ScopesSupported:                        p.metadata.ScopesSupported,
+		RevocationEndpoint:                     fmt.Sprintf("%s%s/revoke", baseURL, prefix),
+		RevocationEndpointAuthMethodsSupported: p.metadata.RevocationEndpointAuthMethodsSupported,
+	}
+
+	// Only advertise Dynamic Client Registration when it is enabled (F2). When
+	// disabled, omit both registration fields (they use omitempty) so clients do
+	// not attempt DCR against an endpoint that returns 403.
+	if p.config.DCREnabled() {
+		metadata.RegistrationEndpoint = fmt.Sprintf("%s%s/register", baseURL, prefix)
+		metadata.RegistrationEndpointAuthMethodsSupported = p.metadata.RegistrationEndpointAuthMethodsSupported
 	}
 
 	handlerutils.JSON(w, http.StatusOK, metadata)

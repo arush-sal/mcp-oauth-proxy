@@ -150,6 +150,7 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `ENABLE_METRICS`            | ❌ | Enable the Prometheus metrics endpoint. Default `false` |
 | `METRICS_PATH`              | ❌ | Path for the Prometheus metrics endpoint. Default `/metrics` |
 | `METRICS_ADDRESS`           | ❌ | When set (e.g. `:9090`), serve metrics on a **separate** listener at this address instead of the main server. When empty and `ENABLE_METRICS=true`, metrics are served on the main server at `METRICS_PATH` |
+| `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | ❌ | Allow clients to self-register via the `/register` endpoint (RFC 7591). Default `true`. When `false`, `/register` returns `403` and the authorization-server metadata omits `registration_endpoint`; existing clients keep working. See "Dynamic Client Registration" |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
 
@@ -232,6 +233,27 @@ Exposed metric names:
   method.
 - `http_request_duration_seconds{method}` — request latency histogram by method.
 - Standard `go_*` and `process_*` runtime/process collectors.
+
+## Dynamic Client Registration
+
+The proxy implements [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)
+Dynamic Client Registration (DCR): clients may self-register by POSTing their
+metadata to `/register`. This is **enabled by default**
+(`ENABLE_DYNAMIC_CLIENT_REGISTRATION=true`), preserving existing behavior.
+
+Set `ENABLE_DYNAMIC_CLIENT_REGISTRATION=false` to turn it off. When disabled:
+
+- `POST /register` returns **`403 Forbidden`** with an OAuth error body
+  (`{"error":"access_denied","error_description":"dynamic client registration is disabled"}`).
+  A `403` is used (rather than `404`) so callers can tell the endpoint exists but
+  is switched off.
+- The authorization-server metadata
+  (`/.well-known/oauth-authorization-server`) **omits** `registration_endpoint`
+  (and `registration_endpoint_auth_methods_supported`) so clients do not attempt
+  DCR.
+- **Existing / already-registered clients keep working.** Disabling DCR only
+  blocks *new* self-registration; stored clients continue to authenticate and
+  authorize normally.
 
 ## Authorization / Allowlist
 
