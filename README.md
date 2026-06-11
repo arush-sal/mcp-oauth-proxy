@@ -152,6 +152,7 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `METRICS_PATH`              | ❌ | Path for the Prometheus metrics endpoint. Default `/metrics` |
 | `METRICS_ADDRESS`           | ❌ | When set (e.g. `:9090`), serve metrics on a **separate** listener at this address instead of the main server. When empty and `ENABLE_METRICS=true`, metrics are served on the main server at `METRICS_PATH` |
 | `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | ❌ | Allow clients to self-register via the `/register` endpoint (RFC 7591). Default `true`. When `false`, `/register` returns `403` and the authorization-server metadata omits `registration_endpoint`; existing clients keep working. See "Dynamic Client Registration" |
+| `TRUST_FORWARDED_HEADERS`   | ❌ | Trust client-supplied forwarded headers (`X-Mcp-Oauth-Proxy-URL`, `X-Forwarded-Proto`) when deriving the external base URL. Default `true` preserves behavior (honors those headers). Set `false` when the proxy is **not** behind a trusted reverse proxy: the proxy then does **not** trust those forwarded headers and derives the external base URL (which feeds redirect URIs, OAuth metadata, and the `WWW-Authenticate` `resource_metadata`) from the connection (TLS) and the request `Host` header. Note that the `Host` header itself should be constrained by a fronting reverse proxy / allowed-host config at the infrastructure layer |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
 

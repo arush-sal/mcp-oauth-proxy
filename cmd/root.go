@@ -85,6 +85,16 @@ type RootCmd struct {
 	// stored clients keep working.
 	EnableDynamicClientRegistration bool `name:"enable-dynamic-client-registration" env:"ENABLE_DYNAMIC_CLIENT_REGISTRATION" usage:"Allow clients to self-register via the /register endpoint (RFC 7591). When false, /register returns 403 and metadata omits the registration endpoint; existing clients keep working" default:"true"`
 
+	// Trust forwarded headers (follow-up #2). Default true preserves today's
+	// behavior (honors X-Mcp-Oauth-Proxy-URL / X-Forwarded-Proto). When false,
+	// the proxy does NOT trust those forwarded headers; the external base URL
+	// (which feeds redirect URIs, metadata, and the WWW-Authenticate
+	// resource_metadata) is derived from the connection (TLS) and the request
+	// Host header. Set false when the proxy is NOT behind a trusted reverse
+	// proxy. Note: the Host header itself should be constrained by a fronting
+	// reverse proxy / allowed-host config at the infrastructure layer.
+	TrustForwardedHeaders bool `name:"trust-forwarded-headers" env:"TRUST_FORWARDED_HEADERS" usage:"Trust client-supplied forwarded headers (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto) when deriving the external base URL. When false, those forwarded headers are not trusted and the base URL is derived from the connection (TLS) and the request Host header; constrain the Host header at the infrastructure layer (fronting reverse proxy / allowed-host config)" default:"true"`
+
 	// Logging
 	Verbose bool `name:"verbose,v" usage:"Enable verbose logging"`
 	Version bool `name:"version" usage:"Show version information"`
@@ -144,6 +154,8 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		MetricsAddress: c.MetricsAddress,
 
 		EnableDynamicClientRegistration: &c.EnableDynamicClientRegistration,
+
+		TrustForwardedHeaders: &c.TrustForwardedHeaders,
 	}
 
 	// Validate configuration

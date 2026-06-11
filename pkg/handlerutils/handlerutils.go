@@ -1,12 +1,38 @@
 package handlerutils
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 )
+
+// trustForwardedKey is the context key under which the resolved
+// "trust forwarded headers" policy is stored. Using an unexported struct type
+// avoids collisions with other context values.
+type trustForwardedKeyType struct{}
+
+var trustForwardedKey = trustForwardedKeyType{}
+
+// WithTrustForwarded returns a copy of ctx carrying whether client-supplied
+// forwarded headers (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto) should be
+// trusted when deriving the external base URL.
+func WithTrustForwarded(ctx context.Context, trust bool) context.Context {
+	return context.WithValue(ctx, trustForwardedKey, trust)
+}
+
+// trustForwardedFromContext reports whether forwarded headers should be
+// trusted. When the value is ABSENT, it returns true so any code path or test
+// that does not set it preserves today's trusting behavior.
+func trustForwardedFromContext(ctx context.Context) bool {
+	trust, ok := ctx.Value(trustForwardedKey).(bool)
+	if !ok {
+		return true
+	}
+	return trust
+}
 
 func JSON(w http.ResponseWriter, statusCode int, obj any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -49,14 +75,28 @@ func GetClientIP(r *http.Request) string {
 }
 
 // GetBaseURL returns the URL of the request without the path and
-// infers the scheme (http or https)
+// infers the scheme (http or https).
+//
+// Whether client-supplied forwarded headers are trusted is read from the
+// request context (see WithTrustForwarded). When trust is enabled (the default
+// and the absent-context case), it honors X-Mcp-Oauth-Proxy-URL and then
+// X-Forwarded-Proto, preserving the historical behavior. When trust is
+// disabled, both forwarded headers are ignored: the scheme is derived from
+// r.TLS only (https iff r.TLS != nil) and the host from r.Host. Note that
+// r.Host is still the client-supplied HTTP Host header, so it should be
+// constrained by a fronting reverse proxy / allowed-host config at the
+// infrastructure layer.
 func GetBaseURL(r *http.Request) string {
-	if url := r.Header.Get("X-Mcp-Oauth-Proxy-URL"); url != "" {
-		return url
+	trust := trustForwardedFromContext(r.Context())
+
+	if trust {
+		if url := r.Header.Get("X-Mcp-Oauth-Proxy-URL"); url != "" {
+			return url
+		}
 	}
 
 	scheme := "http"
-	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+	if r.TLS != nil || (trust && r.Header.Get("X-Forwarded-Proto") == "https") {
 		scheme = "https"
 	}
 	return fmt.Sprintf("%s://%s", scheme, r.Host)

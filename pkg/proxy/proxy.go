@@ -430,16 +430,30 @@ func (p *OAuthProxy) GetHandler() http.Handler {
 	// Instrument the whole handler with Prometheus middleware when metrics are
 	// enabled. This counts every request (by code/method) and records request
 	// duration, including the probe and metrics endpoints themselves.
+	var handler http.Handler = loggedHandler
 	if p.metrics != nil {
-		return p.metrics.instrument(loggedHandler)
+		handler = p.metrics.instrument(loggedHandler)
 	}
 
-	return loggedHandler
+	// The resolved "trust forwarded headers" policy is injected per-route by
+	// withCORS (the shared wrapper applied to every route in SetupRoutes), so it
+	// holds regardless of whether the proxy is served via GetHandler or via a
+	// direct SetupRoutes call. No additional outer wrapper is needed here.
+	return handler
 }
 
-// withCORS wraps a handler with CORS headers
+// withCORS wraps a handler with CORS headers. It is the shared per-route
+// wrapper applied to EVERY route registered by SetupRoutes (OAuth, metadata,
+// health/ready/metrics, and the catch-all proxy route), so it also injects the
+// resolved "trust forwarded headers" policy into the request context here. This
+// guarantees the policy holds for direct-SetupRoutes callers (embedding /
+// middleware mode), not just for GetHandler. The injection is idempotent and
+// always writes the same configured value, so a redundant outer wrapper (if
+// any) is harmless.
 func (p *OAuthProxy) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(handlerutils.WithTrustForwarded(r.Context(), p.config.TrustForwardedHeadersEnabled()))
+
 		// Set CORS headers
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
