@@ -596,17 +596,23 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 						// id_token verify failure) we fail closed for THIS request
 						// but keep the session so a blip does not log everyone out
 						// (CONCERN 2). Either way: 401, never 500.
+						// The challenge message must match what actually happened: a
+						// genuine deny revokes the session and says so; a transient
+						// infra failure preserves the session and must NOT claim the
+						// access was revoked.
+						challenge := "Re-authorization failed; please re-authenticate"
 						if errors.Is(denied, authz.ErrDenied) {
 							log.Printf("authorization revoked on refresh for user=%q: %v", tokenInfo.UserID, denied)
 							p.revokeGrantOnDeny(r, tokenInfo.GrantID)
+							challenge = "Access revoked: you are no longer authorized to use this resource"
 						} else {
 							log.Printf("authorization re-check failed on refresh for user=%q (session preserved): %v", tokenInfo.UserID, denied)
 						}
 						// Agent re-auth challenge (F7): the session revoke above (on a
 						// genuine deny) precedes this write. Emit 401 WITH the challenge
-						// (not a bare 401) so the de-authorized agent can re-run
-						// discovery; the revoked session forces a fresh authorization.
-						handlerutils.WriteBearerChallenge(w, r, "Access revoked: you are no longer authorized to use this resource")
+						// (not a bare 401) so the agent can re-run discovery; on a
+						// genuine deny the revoked session forces a fresh authorization.
+						handlerutils.WriteBearerChallenge(w, r, challenge)
 						return
 					}
 					tokenInfo.Props = refreshedProps

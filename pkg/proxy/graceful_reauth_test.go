@@ -33,6 +33,23 @@ func newRefreshedToken() *oauth2.Token {
 	return &oauth2.Token{AccessToken: "fresh-idp-token", Expiry: time.Now().Add(time.Hour)}
 }
 
+// newRefreshedTokenWithIDToken returns a refreshed token carrying a fresh
+// id_token, so reauthorizeOnRefresh routes through the configured
+// IDTokenVerifier. Used to exercise the infra/transient verify-failure path.
+func newRefreshedTokenWithIDToken() *oauth2.Token {
+	return newRefreshedToken().WithExtra(map[string]any{"id_token": "fresh.id.token"})
+}
+
+// failingVerifier is a callback.IDTokenVerifier double whose Verify always
+// returns a NON-ErrDenied error, so reauthorizeOnRefresh fails closed on an
+// infrastructure error (id_token verify blip) rather than an authorization
+// deny. This is the seam for the transient re-auth failure path.
+type failingVerifier struct{}
+
+func (failingVerifier) Verify(context.Context, string) (*idtoken.Claims, error) {
+	return nil, errors.New("transient jwks fetch failure")
+}
+
 func (s *stubProvider) GetAuthorizationURL(string, string, string, string) string { return "" }
 func (s *stubProvider) GetAuthorizationURLWithPKCE(string, string, string, string, string) string {
 	return ""
@@ -163,10 +180,73 @@ func TestMCPProxy_ReauthorizeDenyChallengesAndRevokes(t *testing.T) {
 	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), `Bearer error="invalid_token"`,
 		"deny must carry a re-auth challenge, not a bare 401")
 
+	// The challenge message must accurately state the session was revoked.
+	var denyBody map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &denyBody))
+	assert.Equal(t, "Access revoked: you are no longer authorized to use this resource",
+		denyBody["error_description"], "a genuine deny must say the access was revoked")
+
 	// Session revoke must have happened (precedes the response).
 	td, err := p.db.GetToken(accessTok)
 	require.NoError(t, err)
 	assert.True(t, td.Revoked, "the whole session must be revoked on an authorization deny")
+}
+
+// TestMCPProxy_ReauthorizeInfraErrorChallengesWithoutRevoke: the IdP refresh
+// succeeds and returns a fresh id_token, but verifying it fails transiently
+// (a NON-ErrDenied infrastructure error). The request must fail closed with a
+// 401 challenge, but the message must NOT claim the access was revoked, and the
+// session must be preserved (not revoked) so a transient blip does not log
+// everyone out.
+func TestMCPProxy_ReauthorizeInfraErrorChallengesWithoutRevoke(t *testing.T) {
+	p := newTestProxy(t, &types.Config{Mode: ModeMiddleware, DatabaseDSN: filepath.Join(t.TempDir(), "t.db")})
+
+	// Allowlist would permit the identity; the failure comes from id_token verify.
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+	p.authorizer = a
+
+	// A verifier that always fails with a non-deny error is the infra seam.
+	p.idTokenVerifier = failingVerifier{}
+
+	// Refresh succeeds and returns a fresh id_token so the verifier is invoked.
+	p.providers.RegisterProvider("generic", &stubProvider{refresh: newRefreshedTokenWithIDToken()})
+	p.provider = "generic"
+
+	const grantID = "grant-infra-1"
+	accessTok := "user-1:" + grantID + ":secret"
+	require.NoError(t, p.db.StoreToken(&types.TokenData{
+		AccessToken:           accessTok,
+		RefreshToken:          "user-1:" + grantID + ":refresh",
+		ClientID:              "client-1",
+		UserID:                "user-1",
+		GrantID:               grantID,
+		ExpiresAt:             time.Now().Add(time.Hour),
+		RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
+	}))
+
+	req := expiredTokenInfoReq(t, grantID, "user-1", idtoken.Claims{Email: "user@example.com", EmailVerified: true})
+	rec := httptest.NewRecorder()
+
+	called := false
+	p.mcpProxyHandler(rec, req, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+
+	require.Equal(t, http.StatusUnauthorized, rec.Code, "infra failure must be 401, never 500")
+	assert.False(t, called, "downstream handler must not run on a re-auth infra failure")
+	assert.Contains(t, rec.Header().Get("WWW-Authenticate"), `Bearer error="invalid_token"`,
+		"infra failure must carry a re-auth challenge, not a bare 401")
+
+	// The message must NOT claim revocation: the session was not revoked.
+	var body map[string]string
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	assert.NotContains(t, body["error_description"], "Access revoked",
+		"a transient infra failure must not be reported as a revocation")
+	assert.Equal(t, "Re-authorization failed; please re-authenticate", body["error_description"])
+
+	// Session must be preserved on a transient infra failure.
+	td, err := p.db.GetToken(accessTok)
+	require.NoError(t, err)
+	assert.False(t, td.Revoked, "a transient infra failure must NOT revoke the session")
 }
 
 // TestMCPProxy_HappyRefreshPassesThrough: a valid in-request refresh renews the
