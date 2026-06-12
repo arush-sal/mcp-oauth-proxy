@@ -133,8 +133,9 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		provider = "generic"
 	}
 
-	// Initialize token manager with JWKS and API key auth support
-	tokenManager, err := tokens.NewTokenManagerWithJWKSURLAndAPIKeyAuth(db, config.APIKeyAuthWebhookURL, config.OAuthJWKSURL, config.TrustedIssuer, config.TrustedAudiences)
+	// Provider JWKS validates provider id_tokens during the callback flow. It
+	// must not make arbitrary provider-signed JWTs valid inbound bearer tokens.
+	tokenManager, err := tokens.NewTokenManagerWithJWKSURLAndAPIKeyAuth(db, config.APIKeyAuthWebhookURL, "", "", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize token manager: %w", err)
 	}

@@ -37,6 +37,7 @@ type fakeStore struct {
 	stored        []*types.TokenData
 	revoked       []string
 	revokedGrants []string
+	codeConsumed  bool
 }
 
 func (s *fakeStore) GetClient(string) (*types.ClientInfo, error) { return s.client, nil }
@@ -50,9 +51,17 @@ func (s *fakeStore) StoreToken(t *types.TokenData) error {
 	s.tokens[t.RefreshToken] = &cp
 	return nil
 }
-func (s *fakeStore) ValidateAuthCode(string) (string, string, error) { return "", "", nil }
-func (s *fakeStore) GetGrant(string, string) (*types.Grant, error)   { return s.grant, nil }
-func (s *fakeStore) DeleteAuthCode(string) error                     { return nil }
+func (s *fakeStore) ValidateAuthCode(string) (string, string, error) {
+	return s.grant.ID, s.grant.UserID, nil
+}
+func (s *fakeStore) ConsumeAuthCode(string) (string, string, error) {
+	if s.codeConsumed {
+		return "", "", assertNotFound{}
+	}
+	s.codeConsumed = true
+	return s.grant.ID, s.grant.UserID, nil
+}
+func (s *fakeStore) GetGrant(string, string) (*types.Grant, error) { return s.grant, nil }
 func (s *fakeStore) GetTokenByRefreshToken(rt string) (*types.TokenData, error) {
 	td, ok := s.tokens[rt]
 	if !ok || td.Revoked {
@@ -129,6 +138,7 @@ func newAuthCodeRequest(code, clientID string) *http.Request {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("client_id", clientID)
+	form.Set("code_verifier", "challenge")
 	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return req
@@ -145,13 +155,44 @@ func authCodeStore(t *testing.T) *fakeStore {
 			ID:       "grant-1",
 			UserID:   "user-1",
 			ClientID: "client",
-			// PKCE is enabled so redirect_uri is not required (OAuth 2.1). No
-			// code_verifier is sent, so the verifier check is skipped.
+			// PKCE is enabled so redirect_uri is not required (OAuth 2.1).
 			CodeChallenge:       "challenge",
-			CodeChallengeMethod: "S256",
+			CodeChallengeMethod: "plain",
 		},
 	}
 	return s
+}
+
+func TestAuthorizationCodeGrant_RejectsMissingPKCEVerifier(t *testing.T) {
+	store := authCodeStore(t)
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+	req := newAuthCodeRequest("the-code", "client")
+	require.NoError(t, req.ParseForm())
+	req.Form.Del("code_verifier")
+	req.PostForm.Del("code_verifier")
+	req.Body = http.NoBody
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "code_verifier is required")
+	assert.Empty(t, store.stored)
+	assert.False(t, store.codeConsumed, "failed PKCE validation must not consume the code")
+}
+
+func TestAuthorizationCodeGrant_RejectsSecondRedemption(t *testing.T) {
+	store := authCodeStore(t)
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, newAuthCodeRequest("the-code", "client"))
+	require.Equal(t, http.StatusOK, first.Code)
+
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, newAuthCodeRequest("the-code", "client"))
+	assert.Equal(t, http.StatusBadRequest, second.Code)
+	assert.Len(t, store.stored, 1, "only the atomic consume winner may receive tokens")
 }
 
 // TestAuthorizationCodeGrant_RefreshTokenExpiresAtHonorsCustomConfig is the

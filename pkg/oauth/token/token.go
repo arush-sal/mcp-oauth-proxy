@@ -21,8 +21,8 @@ type TokenStore interface {
 	GetClient(clientID string) (*types.ClientInfo, error)
 	StoreToken(token *types.TokenData) error
 	ValidateAuthCode(code string) (string, string, error)
+	ConsumeAuthCode(code string) (string, string, error)
 	GetGrant(grantID string, userID string) (*types.Grant, error)
-	DeleteAuthCode(code string) error
 	GetTokenByRefreshToken(refreshToken string) (*types.TokenData, error)
 	RevokeToken(token string) error
 	RevokeTokensByGrant(grantID string) error
@@ -177,6 +177,13 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 
 	// Check if PKCE is being used
 	isPkceEnabled := grant.CodeChallenge != ""
+	if isPkceEnabled && codeVerifier == "" {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_request",
+			ErrorDescription: "code_verifier is required for PKCE",
+		})
+		return
+	}
 
 	// OAuth 2.1 requires redirect_uri parameter unless PKCE is used
 	if redirectURI == "" && !isPkceEnabled {
@@ -215,6 +222,15 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		}
 	}
 
+	consumedGrantID, consumedUserID, err := p.db.ConsumeAuthCode(code)
+	if err != nil || consumedGrantID != grantID || consumedUserID != userID {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "Invalid authorization code",
+		})
+		return
+	}
+
 	// Props are stored in the grant and will be accessed when needed
 	// For simple string token generation, we don't need to decrypt them here
 
@@ -250,11 +266,6 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 			ErrorDescription: "Failed to store token",
 		})
 		return
-	}
-
-	// Delete the authorization code (single-use)
-	if err := p.db.DeleteAuthCode(code); err != nil {
-		log.Printf("Error deleting authorization code: %v", err)
 	}
 
 	response := types.TokenResponse{

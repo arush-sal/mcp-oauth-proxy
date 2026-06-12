@@ -151,7 +151,7 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `ENABLE_METRICS`            | ❌ | Enable the Prometheus metrics endpoint. Default `false` |
 | `METRICS_PATH`              | ❌ | Path for the Prometheus metrics endpoint. Default `/metrics` |
 | `METRICS_ADDRESS`           | ❌ | When set (e.g. `:9090`), serve metrics on a **separate** listener at this address instead of the main server. When empty and `ENABLE_METRICS=true`, metrics are served on the main server at `METRICS_PATH` |
-| `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | ❌ | Allow clients to self-register via the `/register` endpoint (RFC 7591). Default `true`. When `false`, `/register` returns `403` and the authorization-server metadata omits `registration_endpoint`; existing clients keep working. See "Dynamic Client Registration" |
+| `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | ❌ | Allow clients to self-register via the `/register` endpoint (RFC 7591). Default `false`. When `false`, `/register` returns `403` and the authorization-server metadata omits `registration_endpoint`; existing clients keep working. See "Dynamic Client Registration" |
 | `TRUST_FORWARDED_HEADERS`   | ❌ | Trust client-supplied forwarded headers (`X-Mcp-Oauth-Proxy-URL`, `X-Forwarded-Proto`, `X-Forwarded-For`, `X-Real-IP`). Default `true` preserves behavior (honors those headers). This toggle governs three things: (1) the external base URL (which feeds redirect URIs, OAuth metadata, and the `WWW-Authenticate` `resource_metadata`), derived from `X-Mcp-Oauth-Proxy-URL` / `X-Forwarded-Proto`; (2) the per-IP rate-limit client IP for `/authorize`, `/token`, `/register`, derived from `X-Forwarded-For` / `X-Real-IP`; and (3) the automatic cookie `Secure` decision (`COOKIE_SECURE=auto`), derived from `X-Forwarded-Proto`. Set `false` when the proxy is **not** behind a trusted reverse proxy: the proxy then ignores all of those forwarded headers and instead derives the scheme from the connection (TLS), the host from the request `Host` header, and the rate-limit client IP from `RemoteAddr` — so a client cannot spoof `X-Forwarded-For` to rotate the rate-limit key or spoof `X-Forwarded-Proto` to flip the cookie `Secure` flag. Note that the `Host` header itself should be constrained by a fronting reverse proxy / allowed-host config at the infrastructure layer |
 
 You should generate a random 32-byte AES key for the `ENCRYPTION_KEY` environment variable using the following command:
@@ -243,10 +243,9 @@ Exposed metric names:
 
 The proxy implements [RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)
 Dynamic Client Registration (DCR): clients may self-register by POSTing their
-metadata to `/register`. This is **enabled by default**
-(`ENABLE_DYNAMIC_CLIENT_REGISTRATION=true`), preserving existing behavior.
-
-Set `ENABLE_DYNAMIC_CLIENT_REGISTRATION=false` to turn it off. When disabled:
+metadata to `/register`. This is **disabled by default**. Set
+`ENABLE_DYNAMIC_CLIENT_REGISTRATION=true` only when unauthenticated client
+self-registration is required. When disabled:
 
 - `POST /register` returns **`403 Forbidden`** with an OAuth error body
   (`{"error":"access_denied","error_description":"dynamic client registration is disabled"}`).

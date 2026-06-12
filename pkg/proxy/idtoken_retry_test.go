@@ -12,6 +12,7 @@ import (
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/oauth/callback"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
+	"github.com/stretchr/testify/require"
 )
 
 // okVerifier satisfies callback.IDTokenVerifier for success-path assertions.
@@ -118,6 +119,25 @@ func TestBuildVerifierWithRetry_ContextCancelAborts(t *testing.T) {
 	if calls != 0 {
 		t.Fatalf("expected 0 build attempts with a pre-cancelled context, got %d", calls)
 	}
+}
+
+func TestProviderJWKSIsNotUsedForInboundBearerValidation(t *testing.T) {
+	previous := defaultVerifierRetry
+	defaultVerifierRetry = retryKnobs{attempts: 1}
+	t.Cleanup(func() { defaultVerifierRetry = previous })
+
+	p, err := NewOAuthProxy(&types.Config{
+		Mode:                ModeForwardAuth,
+		OAuthClientID:       "client",
+		OAuthClientSecret:   "secret",
+		OAuthAuthorizeURL:   "https://accounts.google.com",
+		OAuthIssuerURL:      "https://accounts.google.com",
+		OAuthJWKSURL:        "://invalid-provider-jwks-url",
+		ScopesSupported:     "openid,email",
+		AllowedEmailDomains: []string{"example.com"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, p.Close())
 }
 
 // captureLog runs fn with the standard logger redirected to a buffer and

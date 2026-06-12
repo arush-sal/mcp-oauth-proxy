@@ -9,6 +9,7 @@ import (
 const (
 	AccessTokenCookieName  = "access_token"
 	RefreshTokenCookieName = "refresh_token"
+	OAuthStateCookieName   = "oauth_state"
 )
 
 // Config holds all configuration values for the OAuth proxy
@@ -108,8 +109,8 @@ type Config struct {
 	// /register endpoint accepts new client registrations and whether the
 	// authorization-server metadata advertises a registration_endpoint.
 	//
-	// It is a tri-state pointer so an unset value (nil) preserves today's
-	// behavior (DCR ENABLED). Resolve it through DCREnabled(), never read the
+	// It is a tri-state pointer so an unset value (nil) defaults securely to
+	// DCR DISABLED. Resolve it through DCREnabled(), never read the
 	// pointer directly. When disabled, /register returns 403 and metadata omits
 	// the registration endpoint; pre-existing stored clients keep working.
 	EnableDynamicClientRegistration *bool
@@ -131,9 +132,9 @@ type Config struct {
 }
 
 // DCREnabled reports whether Dynamic Client Registration is enabled. An unset
-// (nil) value defaults to true so existing configs preserve today's behavior.
+// (nil) value defaults to false.
 func (c *Config) DCREnabled() bool {
-	return c.EnableDynamicClientRegistration == nil || *c.EnableDynamicClientRegistration
+	return c.EnableDynamicClientRegistration != nil && *c.EnableDynamicClientRegistration
 }
 
 // TrustForwardedHeadersEnabled reports whether client-supplied forwarded
