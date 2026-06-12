@@ -102,9 +102,12 @@ func TestAuthorize_GoogleHostedDomain(t *testing.T) {
 	a, err := New(Config{GoogleHostedDomains: []string{"corp.example.com"}})
 	require.NoError(t, err)
 
-	require.NoError(t, a.Authorize(Identity{HostedDomain: "corp.example.com"}))
-	assert.ErrorIs(t, a.Authorize(Identity{HostedDomain: "other.example.com"}), ErrDenied)
-	assert.ErrorIs(t, a.Authorize(Identity{HostedDomain: ""}), ErrDenied)
+	// hd matches only when the email is verified, mirroring the email/domain rules.
+	require.NoError(t, a.Authorize(Identity{HostedDomain: "corp.example.com", EmailVerified: true}))
+	assert.ErrorIs(t, a.Authorize(Identity{HostedDomain: "other.example.com", EmailVerified: true}), ErrDenied)
+	assert.ErrorIs(t, a.Authorize(Identity{HostedDomain: "", EmailVerified: true}), ErrDenied)
+	// Even an allowed hd must NOT authorize an unverified account.
+	assert.ErrorIs(t, a.Authorize(Identity{HostedDomain: "corp.example.com", EmailVerified: false}), ErrDenied)
 }
 
 func TestAuthorize_RulesORTogether(t *testing.T) {
@@ -122,8 +125,8 @@ func TestAuthorize_RulesORTogether(t *testing.T) {
 	require.NoError(t, a.Authorize(Identity{Email: "x@example.com", EmailVerified: true}))
 	// matches via group only (email unverified, no domain/hd match)
 	require.NoError(t, a.Authorize(Identity{Email: "x@other.test", EmailVerified: false, Groups: []string{"admins"}}))
-	// matches via hosted domain only
-	require.NoError(t, a.Authorize(Identity{HostedDomain: "corp.example.com"}))
+	// matches via hosted domain only (requires a verified email, like email/domain rules)
+	require.NoError(t, a.Authorize(Identity{HostedDomain: "corp.example.com", EmailVerified: true}))
 	// matches nothing
 	assert.ErrorIs(t, a.Authorize(Identity{Email: "x@other.test", EmailVerified: true, Groups: []string{"users"}, HostedDomain: "nope.test"}), ErrDenied)
 }

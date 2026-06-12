@@ -275,6 +275,22 @@ func (v *Verifier) Verify(ctx context.Context, rawIDToken string) (*Claims, erro
 		return nil, fmt.Errorf("idtoken: unexpected claims type")
 	}
 
+	// OIDC Core 3.1.3.7: when the "aud" claim has MULTIPLE values, the "azp"
+	// (authorized party) claim MUST be present and equal to this client's ID.
+	// WithAudience above only checks membership, so without this an id_token
+	// minted for a different primary client (azp=other) that merely co-lists our
+	// client ID in a multi-valued aud would be accepted. A single-valued aud
+	// does not require azp.
+	if len(jc.Audience) > 1 {
+		azp, err := extractStringClaim(jc.raw, "azp")
+		if err != nil {
+			return nil, fmt.Errorf("idtoken: %w", err)
+		}
+		if azp != v.audience {
+			return nil, fmt.Errorf("idtoken: azp claim must equal the client ID when aud is multi-valued")
+		}
+	}
+
 	groups, err := extractGroups(jc.raw, v.groupsClaim)
 	if err != nil {
 		return nil, fmt.Errorf("idtoken: %w", err)
@@ -307,6 +323,21 @@ func extractGroups(raw map[string]json.RawMessage, claimName string) ([]string, 
 		return nil, fmt.Errorf("groups claim %q: %w", claimName, err)
 	}
 	return []string(g), nil
+}
+
+// extractStringClaim reads a top-level string claim named claimName from the raw
+// claim set. An absent or null claim yields "" with no error; a present but
+// non-string value is an error so the caller fails closed.
+func extractStringClaim(raw map[string]json.RawMessage, claimName string) (string, error) {
+	rawVal, ok := raw[claimName]
+	if !ok || len(rawVal) == 0 || string(rawVal) == "null" {
+		return "", nil
+	}
+	var s string
+	if err := json.Unmarshal(rawVal, &s); err != nil {
+		return "", fmt.Errorf("%s claim is not a string", claimName)
+	}
+	return s, nil
 }
 
 // jwtClaims embeds jwt.RegisteredClaims so the jwt parser validates the

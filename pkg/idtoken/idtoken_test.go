@@ -360,13 +360,92 @@ func TestVerify_ArrayAudienceAccepted(t *testing.T) {
 	v := newTestVerifier(t, srv.URL)
 
 	c := baseClaims()
-	// aud as a JSON array that includes the expected audience.
+	// aud as a JSON array that includes the expected audience. Per OIDC Core
+	// 3.1.3.7, a multi-valued aud requires azp == client ID.
 	c["aud"] = []string{"other-client", testAudience}
+	c["azp"] = testAudience
 	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
 
 	claims, err := v.Verify(context.Background(), raw)
 	require.NoError(t, err)
 	assert.Equal(t, "user@example.com", claims.Email)
+}
+
+func TestVerify_SingleAudNoAzpAccepted(t *testing.T) {
+	// Single-valued aud == clientID with no azp is accepted (azp optional).
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims() // aud is the single testAudience, no azp
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, "user@example.com", claims.Email)
+}
+
+func TestVerify_MultiAudWithMatchingAzpAccepted(t *testing.T) {
+	// Multi-valued aud containing clientID with azp == clientID is accepted.
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["aud"] = []string{"other-client", testAudience}
+	c["azp"] = testAudience
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, "user@example.com", claims.Email)
+}
+
+func TestVerify_MultiAudWithWrongAzpRejected(t *testing.T) {
+	// Multi-valued aud containing clientID but azp == other party is rejected
+	// (OIDC Core 3.1.3.7).
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["aud"] = []string{"other-client", testAudience}
+	c["azp"] = "other-client"
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_MultiAudWithoutAzpRejected(t *testing.T) {
+	// Multi-valued aud containing clientID with azp absent is rejected: when aud
+	// is multi-valued, azp MUST be present and equal to the client ID.
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["aud"] = []string{"other-client", testAudience}
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
+}
+
+func TestVerify_MultiAudNotContainingClientIDRejected(t *testing.T) {
+	// aud not containing clientID is rejected by the audience membership check,
+	// regardless of azp.
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	c := baseClaims()
+	c["aud"] = []string{"other-client", "yet-another"}
+	c["azp"] = testAudience
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	_, err := v.Verify(context.Background(), raw)
+	require.Error(t, err)
 }
 
 func TestClaims_UnmarshalGroups(t *testing.T) {

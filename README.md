@@ -293,11 +293,18 @@ rule (rules OR together); otherwise it is denied with a clear `403`
 - **`ALLOWED_GROUPS`** — allowed if the user's groups intersect this list. The
   groups claim name is configurable via **`GROUPS_CLAIM`** (default `groups`).
 - **`ALLOWED_GOOGLE_HOSTED_DOMAINS`** — checked against the OIDC `hd` claim.
+  Like the email/domain rules, this also requires a **verified** email.
 
 > [!NOTE]
-> **Email verification required.** An email or email-domain rule is satisfied
-> only when the IdP asserts `email_verified == true`. An unverified email will
-> NOT match an email/domain rule.
+> **Email verification required.** An email, email-domain, or Google
+> hosted-domain (`hd`) rule is satisfied only when the IdP asserts
+> `email_verified == true`. An unverified email will NOT match these rules.
+
+> [!NOTE]
+> **Multi-audience id_tokens.** When the verified `id_token`'s `aud` claim has
+> more than one value, the `azp` (authorized party) claim must be present and
+> equal to the OAuth client ID (OIDC Core 3.1.3.7). A single-valued `aud` does
+> not require `azp`.
 
 ### Re-checked on every refresh
 
