@@ -79,11 +79,11 @@ type RootCmd struct {
 	MetricsPath    string `name:"metrics-path" env:"METRICS_PATH" usage:"Path for the Prometheus metrics endpoint" default:"/metrics"`
 	MetricsAddress string `name:"metrics-address" env:"METRICS_ADDRESS" usage:"When set (e.g. ':9090'), serve metrics on a SEPARATE listener at this address instead of the main mux"`
 
-	// Dynamic Client Registration (DCR) toggle (F2). Default true preserves
-	// today's behavior. When false, /register returns 403 and the
-	// authorization-server metadata omits the registration endpoint; existing
-	// stored clients keep working.
-	EnableDynamicClientRegistration bool `name:"enable-dynamic-client-registration" env:"ENABLE_DYNAMIC_CLIENT_REGISTRATION" usage:"Allow clients to self-register via the /register endpoint (RFC 7591). When false, /register returns 403 and metadata omits the registration endpoint; existing clients keep working" default:"true"`
+	// Dynamic Client Registration (DCR) toggle (F2). Default false keeps
+	// unauthenticated client registration closed. When false, /register returns
+	// 403 and the authorization-server metadata omits the registration endpoint;
+	// existing stored clients keep working.
+	EnableDynamicClientRegistration bool `name:"enable-dynamic-client-registration" env:"ENABLE_DYNAMIC_CLIENT_REGISTRATION" usage:"Allow clients to self-register via the /register endpoint (RFC 7591). When false, /register returns 403 and metadata omits the registration endpoint; existing clients keep working" default:"false"`
 
 	// Trust forwarded headers (follow-up #2). Default true preserves today's
 	// behavior (honors X-Mcp-Oauth-Proxy-URL / X-Forwarded-Proto). When false,

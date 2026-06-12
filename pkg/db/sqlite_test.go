@@ -148,4 +148,20 @@ func TestSQLiteDatabase(t *testing.T) {
 		_, _, err = db.ValidateAuthCode(code)
 		assert.Error(t, err) // Should fail because code is deleted
 	})
+
+	t.Run("TestConsumeAuthCodeIsSingleUse", func(t *testing.T) {
+		code := "single_use_auth_code_sqlite"
+		grantID := "test_grant_sqlite"
+		userID := "test_user"
+
+		require.NoError(t, db.StoreAuthCode(code, grantID, userID))
+
+		gotGrantID, gotUserID, err := db.ConsumeAuthCode(code)
+		require.NoError(t, err)
+		assert.Equal(t, grantID, gotGrantID)
+		assert.Equal(t, userID, gotUserID)
+
+		_, _, err = db.ConsumeAuthCode(code)
+		assert.Error(t, err)
+	})
 }

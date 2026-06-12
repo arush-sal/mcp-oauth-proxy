@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -73,4 +74,16 @@ func TestSendUnauthorized_BrowserPathRedirects(t *testing.T) {
 	assert.Equal(t, http.StatusFound, rec.Code)
 	assert.NotEmpty(t, rec.Header().Get("X-Redirect-URL"), "browser path must set X-Redirect-URL")
 	assert.Empty(t, rec.Header().Get("WWW-Authenticate"), "browser redirect path must not emit a Bearer challenge")
+	stateCookie := findResponseCookie(rec.Result().Cookies(), types.OAuthStateCookieName)
+	require.NotNil(t, stateCookie, "browser OAuth redirect must bind state to a cookie")
+	assert.NotEmpty(t, stateCookie.Value)
+}
+
+func findResponseCookie(cookies []*http.Cookie, name string) *http.Cookie {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie
+		}
+	}
+	return nil
 }

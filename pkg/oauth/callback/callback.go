@@ -164,6 +164,24 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	error := r.URL.Query().Get("error")
 	errorDescription := r.URL.Query().Get("error_description")
 
+	stateCookie, err := r.Cookie(types.OAuthStateCookieName)
+	if err != nil || state == "" || stateCookie.Value != state {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_request",
+			ErrorDescription: "Invalid or missing state cookie",
+		})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     types.OAuthStateCookieName,
+		Value:    "",
+		Path:     p.routePrefix + "/callback",
+		MaxAge:   -1,
+		HttpOnly: true,
+		Secure:   p.session.SecureForRequest(handlerutils.RequestIsHTTPS(r)),
+		SameSite: p.session.SameSite,
+	})
+
 	// Check for OAuth errors
 	if error != "" {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{

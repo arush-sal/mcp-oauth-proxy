@@ -252,6 +252,13 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 		return "", fmt.Errorf("failed to store new token: %w", err)
 	}
 
+	// Revoke the row backing the inbound refresh/access token pair after the
+	// replacement has been stored. This prevents replay of a stolen old refresh
+	// cookie from minting a parallel session.
+	if err := p.db.RevokeToken(refreshToken); err != nil {
+		fmt.Printf("Failed to revoke old refresh token after rotation: %v\n", err)
+	}
+
 	// Determine if request is secure for cookie Secure flag. RequestIsHTTPS is
 	// the single source of truth shared with GetBaseURL, so the cookie Secure
 	// flag matches the derived base-URL scheme.
@@ -390,6 +397,16 @@ func (p *TokenValidator) handleOauthFlow(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     types.OAuthStateCookieName,
+		Value:    stateKey,
+		Path:     p.routePrefix + "/callback",
+		MaxAge:   15 * 60,
+		HttpOnly: true,
+		Secure:   p.session.SecureForRequest(handlerutils.RequestIsHTTPS(r)),
+		SameSite: p.session.SameSite,
+	})
 
 	// Build the authorization URL directly to OAuth provider (not our /authorize)
 	redirectURI := fmt.Sprintf("%s%s/callback", handlerutils.GetBaseURL(r), p.routePrefix)

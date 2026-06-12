@@ -369,6 +369,34 @@ func TestRefreshCookieAttributesHonored(t *testing.T) {
 	assert.InDelta(t, (2 * time.Hour).Seconds(), time.Until(newTok.RefreshTokenExpiresAt).Seconds(), 30)
 }
 
+func TestRefreshAccessTokenRevokesOldTokenPair(t *testing.T) {
+	key := make([]byte, 32)
+	const userID, grantID = "user-1", "grant-1"
+	accessToken := userID + ":" + grantID + ":access-secret"
+	refreshToken := userID + ":" + grantID + ":refresh-secret"
+	tokenData := &types.TokenData{
+		AccessToken:           accessToken,
+		RefreshToken:          refreshToken,
+		UserID:                userID,
+		GrantID:               grantID,
+		ExpiresAt:             time.Now().Add(5 * time.Minute),
+		RefreshTokenExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	grant := grantWithClaims(t, idtoken.Claims{Email: "user@example.com", EmailVerified: true})
+	a, err := authz.New(authz.Config{EmailDomains: []string{"example.com"}})
+	require.NoError(t, err)
+
+	store := &fakeTokenStore{grant: grant, refreshData: tokenData}
+	v := newCookieValidator(t, store, a, tokenData, grant)
+	rec := httptest.NewRecorder()
+
+	_, err = v.refreshAccessToken(rec, cookieRequest(t, key, accessToken, refreshToken))
+
+	require.NoError(t, err)
+	assert.Contains(t, store.revoked, refreshToken,
+		"cookie rotation must revoke the row backing the old refresh/access token pair")
+}
+
 // TestRefreshCookieDefaultsReproduceLegacy confirms default config yields the
 // historical 3600 / 2592000 MaxAge, Lax SameSite, and auto Secure (off on HTTP).
 func TestRefreshCookieDefaultsReproduceLegacy(t *testing.T) {

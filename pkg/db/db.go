@@ -190,6 +190,21 @@ func (d *Store) ValidateAuthCode(code string) (string, string, error) {
 	return authCode.GrantID, authCode.UserID, nil
 }
 
+// ConsumeAuthCode atomically validates and deletes a single-use authorization
+// code. Concurrent redemption attempts can therefore have only one winner.
+func (d *Store) ConsumeAuthCode(code string) (string, string, error) {
+	var grantID, userID string
+	err := d.db.Raw(
+		"DELETE FROM authorization_codes WHERE code = ? AND expires_at > ? RETURNING grant_id, user_id",
+		code,
+		time.Now(),
+	).Row().Scan(&grantID, &userID)
+	if err != nil {
+		return "", "", err
+	}
+	return grantID, userID, nil
+}
+
 // DeleteAuthCode deletes an authorization code (single-use)
 func (d *Store) DeleteAuthCode(code string) error {
 	return d.db.Delete(&types.AuthorizationCode{}, "code = ?", code).Error

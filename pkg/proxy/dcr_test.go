@@ -36,32 +36,31 @@ func newDCRTestProxy(t *testing.T, enableDCR *bool) http.Handler {
 
 const dcrRegisterBody = `{"redirect_uris":["https://client.example.com/callback"],"client_name":"Test Client","token_endpoint_auth_method":"none"}`
 
-// TestDCREnabledByDefault asserts that with no explicit toggle (nil), DCR is on:
-// /register registers a client and metadata advertises registration_endpoint.
-func TestDCREnabledByDefault(t *testing.T) {
+// TestDCRDisabledByDefault asserts that with no explicit toggle (nil), DCR is
+// off: /register is forbidden and metadata omits registration_endpoint.
+func TestDCRDisabledByDefault(t *testing.T) {
 	handler := newDCRTestProxy(t, nil)
 
-	t.Run("RegisterSucceeds", func(t *testing.T) {
+	t.Run("RegisterForbidden", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/register", strings.NewReader(dcrRegisterBody))
 		req.Header.Set("Content-Type", "application/json")
 		handler.ServeHTTP(w, req)
 
-		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-		assert.Contains(t, w.Body.String(), "client_id")
+		require.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
 	})
 
-	t.Run("MetadataAdvertisesRegistrationEndpoint", func(t *testing.T) {
+	t.Run("MetadataOmitsRegistrationEndpoint", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("GET", "/.well-known/oauth-authorization-server", nil)
 		handler.ServeHTTP(w, req)
 
 		require.Equal(t, http.StatusOK, w.Code)
-		assert.Contains(t, w.Body.String(), "registration_endpoint")
+		assert.NotContains(t, w.Body.String(), "registration_endpoint")
 	})
 }
 
-// TestDCRExplicitlyEnabled mirrors the default but sets the toggle to true.
+// TestDCRExplicitlyEnabled opts into dynamic registration.
 func TestDCRExplicitlyEnabled(t *testing.T) {
 	handler := newDCRTestProxy(t, boolPtr(true))
 

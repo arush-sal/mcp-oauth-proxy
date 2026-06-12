@@ -142,6 +142,15 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	redirectURI := fmt.Sprintf("%s%s/callback", handlerutils.GetBaseURL(r), p.routePrefix)
+	http.SetCookie(w, &http.Cookie{
+		Name:     types.OAuthStateCookieName,
+		Value:    stateKey,
+		Path:     p.routePrefix + "/callback",
+		MaxAge:   15 * 60,
+		HttpOnly: true,
+		Secure:   handlerutils.RequestIsHTTPS(r),
+		SameSite: http.SameSiteLaxMode,
+	})
 
 	// Generate authorization URL with the provider
 	authURL := p.provider.GetAuthorizationURL(

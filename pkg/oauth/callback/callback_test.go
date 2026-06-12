@@ -100,7 +100,34 @@ func defaultSession() types.SessionConfig {
 func newCallbackRequest(t *testing.T) (*httptest.ResponseRecorder, *http.Request) {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/callback?code=abc&state=xyz", nil)
+	req.AddCookie(&http.Cookie{Name: types.OAuthStateCookieName, Value: "xyz"})
 	return httptest.NewRecorder(), req
+}
+
+func TestCallback_RequiresMatchingBrowserStateCookie(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cookie *http.Cookie
+	}{
+		{name: "missing"},
+		{name: "mismatch", cookie: &http.Cookie{Name: types.OAuthStateCookieName, Value: "other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{authRequest: map[string]any{"client_id": "client", "scope": "openid"}}
+			h := NewHandler(store, &fakeProvider{}, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+			req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/callback?code=abc&state=xyz", nil)
+			if tc.cookie != nil {
+				req.AddCookie(tc.cookie)
+			}
+			rec := httptest.NewRecorder()
+
+			h.ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusBadRequest, rec.Code)
+			assert.Contains(t, rec.Body.String(), "Invalid or missing state cookie")
+			assert.Nil(t, store.storedGrant)
+		})
+	}
 }
 
 func decryptGrantProps(t *testing.T, grant *types.Grant) map[string]any {
@@ -477,6 +504,7 @@ func uiCallbackRequest(t *testing.T, secureScheme bool) (*httptest.ResponseRecor
 		scheme = "http"
 	}
 	req := httptest.NewRequest(http.MethodGet, scheme+"://proxy.example.com/callback?code=abc&state=xyz", nil)
+	req.AddCookie(&http.Cookie{Name: types.OAuthStateCookieName, Value: "xyz"})
 	if !secureScheme {
 		// httptest.NewRequest sets TLS for https URLs; clear it for the plain case.
 		req.TLS = nil
