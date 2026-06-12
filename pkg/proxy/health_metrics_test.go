@@ -71,6 +71,40 @@ func TestHealthBackCompat(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "ok")
 }
 
+func TestHealthPathEqualsLegacyNoPanic(t *testing.T) {
+	// HEALTH_PATH=/health with an empty RoutePrefix makes the configured
+	// liveness probe path identical to the legacy "/health" route. Building the
+	// handler must NOT panic on a duplicate GET /health registration, and
+	// /health must still return a 200 liveness response.
+	p := newTestProxy(t, &types.Config{HealthPath: "/health"})
+
+	var handler http.Handler
+	require.NotPanics(t, func() {
+		handler = p.GetHandler()
+	}, "building handler with HEALTH_PATH=/health and empty prefix must not panic")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Body.String(), "ok")
+}
+
+func TestDefaultServesLegacyHealthAndHealthz(t *testing.T) {
+	// Default config (HealthPath defaults to /healthz) must expose BOTH the
+	// legacy /health route and the /healthz probe, plus /readyz.
+	p := newTestProxy(t, &types.Config{})
+	handler := p.GetHandler()
+
+	for _, path := range []string{"/health", "/healthz", "/readyz"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		handler.ServeHTTP(w, req)
+		assert.Equalf(t, http.StatusOK, w.Code, "path %s should be 200", path)
+	}
+}
+
 func TestReadinessOK(t *testing.T) {
 	p := newTestProxy(t, &types.Config{})
 	handler := p.GetHandler()

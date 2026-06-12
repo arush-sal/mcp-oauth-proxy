@@ -37,14 +37,43 @@ func TestResolveHealthMetricsConfig_CustomPaths(t *testing.T) {
 
 func TestValidateHealthMetricsConfig(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     Config
-		wantErr bool
+		name        string
+		cfg         Config
+		routePrefix string
+		wantErr     bool
 	}{
 		{
 			name:    "distinct defaults pass",
 			cfg:     Config{},
 			wantErr: false,
+		},
+		{
+			name: "legacy health equals configured health path is allowed (dedup)",
+			// prefix=="" + HealthPath=="/health" -> legacy "/health" == HealthPath.
+			// The liveness probe serves that path; the legacy route is deduped, so
+			// this must NOT be reported as an error.
+			cfg:     Config{HealthPath: "/health"},
+			wantErr: false,
+		},
+		{
+			name: "legacy health collides with ready path rejected",
+			// prefix=="" + ReadyPath=="/health" -> legacy "/health" == ReadyPath.
+			// Different handlers on the same pattern: an unavoidable collision.
+			cfg:     Config{ReadyPath: "/health"},
+			wantErr: true,
+		},
+		{
+			name: "legacy health collides with metrics on main mux rejected",
+			// prefix=="" + MetricsPath=="/health" -> legacy "/health" == MetricsPath.
+			cfg:     Config{EnableMetrics: true, MetricsPath: "/health"},
+			wantErr: true,
+		},
+		{
+			name: "legacy health with non-colliding prefix passes",
+			// prefix=="/oauth2" -> legacy "/oauth2/health" collides with nothing.
+			cfg:         Config{ReadyPath: "/health"},
+			routePrefix: "/oauth2",
+			wantErr:     false,
 		},
 		{
 			name:    "metrics on main mux with distinct paths pass",
@@ -90,7 +119,7 @@ func TestValidateHealthMetricsConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := ResolveHealthMetricsConfig(&tt.cfg)
-			err := h.Validate()
+			err := h.Validate(tt.routePrefix)
 			if tt.wantErr && err == nil {
 				t.Fatalf("Validate() = nil, want error")
 			}

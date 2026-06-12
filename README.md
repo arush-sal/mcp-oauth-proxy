@@ -213,7 +213,10 @@ exact paths and therefore never fall into the catch-all proxy route.
 > [!NOTE]
 > The legacy `/health` route is kept as a **back-compat alias of liveness** and
 > still returns `200` with `{"status":"ok"}`. Unlike the new probes, `/health`
-> remains mounted under `ROUTE_PREFIX` (its historical behavior). Prefer
+> remains mounted under `ROUTE_PREFIX` (its historical behavior). When the
+> liveness probe is configured to that same path (e.g. `HEALTH_PATH=/health`
+> with no prefix) it simply *is* the liveness route — the duplicate legacy
+> registration is skipped, so there is no startup collision. Prefer
 > `HEALTH_PATH`/`READY_PATH` for new deployments.
 
 **Metrics**

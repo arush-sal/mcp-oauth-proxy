@@ -196,14 +196,20 @@ func ResolveHealthMetricsConfig(c *Config) HealthMetricsConfig {
 // Validate checks the resolved health/metrics policy for path collisions and
 // malformed paths that would otherwise panic http.ServeMux at route setup.
 // Call it on the result of ResolveHealthMetricsConfig so defaults are already
-// applied. It enforces:
+// applied. routePrefix is the configured RoutePrefix (may be ""); it is needed
+// to detect collisions with the legacy "<routePrefix>/health" liveness route
+// that SetupRoutes also registers on the main mux. It enforces:
 //   - HealthPath, ReadyPath (and MetricsPath when metrics are enabled) must be
 //     absolute paths beginning with "/".
 //   - HealthPath != ReadyPath (both always register on the main mux).
 //   - When metrics share the main mux (EnableMetrics && MetricsAddress==""),
 //     MetricsPath must not collide with HealthPath or ReadyPath. On a separate
 //     listener the metrics path lives on its own mux, so a collision is allowed.
-func (h HealthMetricsConfig) Validate() error {
+//   - The legacy "<routePrefix>/health" route must not collide with ReadyPath
+//     or (on the main mux) MetricsPath. A collision with HealthPath is allowed:
+//     the liveness probe serves that exact path, so SetupRoutes simply skips the
+//     duplicate legacy registration (back-compat is preserved).
+func (h HealthMetricsConfig) Validate(routePrefix string) error {
 	if !strings.HasPrefix(h.HealthPath, "/") {
 		return fmt.Errorf("health path %q must be an absolute path starting with %q", h.HealthPath, "/")
 	}
@@ -225,6 +231,17 @@ func (h HealthMetricsConfig) Validate() error {
 				return fmt.Errorf("metrics path %q collides with ready path on the main mux", h.MetricsPath)
 			}
 		}
+	}
+	// The legacy liveness route registered by SetupRoutes is fully qualified as
+	// routePrefix + "/health". A collision with HealthPath is benign (deduped),
+	// but a collision with ReadyPath or main-mux MetricsPath would map two
+	// different handlers onto one pattern and panic http.ServeMux.
+	legacyHealth := routePrefix + "/health"
+	if legacyHealth == h.ReadyPath {
+		return fmt.Errorf("legacy health route %q collides with ready path on the main mux", legacyHealth)
+	}
+	if h.MetricsOnMainMux() && legacyHealth == h.MetricsPath {
+		return fmt.Errorf("legacy health route %q collides with metrics path on the main mux", legacyHealth)
 	}
 	return nil
 }

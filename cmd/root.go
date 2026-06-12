@@ -311,7 +311,7 @@ func (c *RootCmd) validateConfig() error {
 		MetricsPath:    c.MetricsPath,
 		MetricsAddress: c.MetricsAddress,
 	})
-	if err := hmCfg.Validate(); err != nil {
+	if err := hmCfg.Validate(c.RoutePrefix); err != nil {
 		return fmt.Errorf("invalid health/metrics configuration: %w", err)
 	}
 	return nil

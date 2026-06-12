@@ -551,7 +551,21 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	// Get route prefix from config
 	prefix := p.config.RoutePrefix
 
-	mux.HandleFunc("GET "+prefix+"/health", p.withCORS(p.healthHandler))
+	// Legacy liveness route. Register it unless its fully-qualified pattern
+	// already equals a configured probe/metrics pattern that
+	// registerHealthMetricsRoutes mounts on the main mux below. In the common
+	// case of an empty prefix with HEALTH_PATH=/health the liveness probe serves
+	// the exact same path with the same handler, so skipping the duplicate keeps
+	// /health back-compat intact while avoiding an http.ServeMux panic on a
+	// duplicate "GET /health" registration. A genuine collision with ReadyPath
+	// or main-mux MetricsPath is rejected earlier by HealthMetricsConfig.Validate.
+	legacyHealth := prefix + "/health"
+	hm := p.healthMetricsCfg
+	collidesWithProbe := legacyHealth == hm.HealthPath || legacyHealth == hm.ReadyPath ||
+		(hm.MetricsOnMainMux() && legacyHealth == hm.MetricsPath)
+	if !collidesWithProbe {
+		mux.HandleFunc("GET "+legacyHealth, p.withCORS(p.healthHandler))
+	}
 
 	// Health & metrics endpoints (F6). These are registered at the ROOT (never
 	// under RoutePrefix) so probes have stable paths, mirroring how the
