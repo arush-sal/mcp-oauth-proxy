@@ -168,35 +168,32 @@ func TestResolveSessionConfig_InvalidDurationString(t *testing.T) {
 	}
 }
 
-func TestSessionConfig_SecureFor(t *testing.T) {
-	httpsReq := httptest_NewRequest(true)
-	httpReq := httptest_NewRequest(false)
-
+// TestSessionConfig_SecureForRequest verifies the tri-state maps over a
+// pre-resolved requestIsHTTPS bool: Always=>true, Never=>false, Auto=>passthrough.
+// The https-detection rule itself lives in handlerutils.RequestIsHTTPS (the
+// single source of truth); this method only applies the tri-state policy.
+func TestSessionConfig_SecureForRequest(t *testing.T) {
 	auto := SessionConfig{CookieSecure: CookieSecureAuto}
-	if !auto.SecureForRequest(httpsReq) {
-		t.Error("auto: expected Secure on HTTPS request")
+	if !auto.SecureForRequest(true) {
+		t.Error("auto: expected Secure when requestIsHTTPS=true")
 	}
-	if auto.SecureForRequest(httpReq) {
-		t.Error("auto: expected not Secure on plain HTTP request")
+	if auto.SecureForRequest(false) {
+		t.Error("auto: expected not Secure when requestIsHTTPS=false")
 	}
 
 	always := SessionConfig{CookieSecure: CookieSecureAlways}
-	if !always.SecureForRequest(httpReq) {
-		t.Error("always: expected Secure even on plain HTTP")
+	if !always.SecureForRequest(false) {
+		t.Error("always: expected Secure even when requestIsHTTPS=false")
+	}
+	if !always.SecureForRequest(true) {
+		t.Error("always: expected Secure when requestIsHTTPS=true")
 	}
 
 	never := SessionConfig{CookieSecure: CookieSecureNever}
-	if never.SecureForRequest(httpsReq) {
-		t.Error("never: expected not Secure even on HTTPS")
+	if never.SecureForRequest(true) {
+		t.Error("never: expected not Secure even when requestIsHTTPS=true")
 	}
-}
-
-// httptest_NewRequest builds a request whose "secure" signal matches the
-// existing isSecureRequest semantics (TLS set OR X-Forwarded-Proto: https).
-func httptest_NewRequest(secure bool) *http.Request {
-	r, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
-	if secure {
-		r.Header.Set("X-Forwarded-Proto", "https")
+	if never.SecureForRequest(false) {
+		t.Error("never: expected not Secure when requestIsHTTPS=false")
 	}
-	return r
 }

@@ -93,7 +93,7 @@ type RootCmd struct {
 	// Host header. Set false when the proxy is NOT behind a trusted reverse
 	// proxy. Note: the Host header itself should be constrained by a fronting
 	// reverse proxy / allowed-host config at the infrastructure layer.
-	TrustForwardedHeaders bool `name:"trust-forwarded-headers" env:"TRUST_FORWARDED_HEADERS" usage:"Trust client-supplied forwarded headers (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto) when deriving the external base URL. When false, those forwarded headers are not trusted and the base URL is derived from the connection (TLS) and the request Host header; constrain the Host header at the infrastructure layer (fronting reverse proxy / allowed-host config)" default:"true"`
+	TrustForwardedHeaders bool `name:"trust-forwarded-headers" env:"TRUST_FORWARDED_HEADERS" usage:"Trust client-supplied forwarded headers. When true, they govern: the external base URL (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto), the per-IP rate-limit client IP (X-Forwarded-For, X-Real-IP), and the auto cookie-Secure decision (X-Forwarded-Proto, X-Mcp-Oauth-Proxy-URL scheme). When false, all of those forwarded headers are ignored: the base URL and Secure flag come from the connection (TLS) and the request Host, and the rate-limit IP comes from RemoteAddr; constrain the Host header at the infrastructure layer (fronting reverse proxy / allowed-host config)" default:"true"`
 
 	// Logging
 	Verbose bool `name:"verbose,v" usage:"Enable verbose logging"`

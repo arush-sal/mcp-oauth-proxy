@@ -252,8 +252,10 @@ func (p *TokenValidator) refreshAccessToken(w http.ResponseWriter, r *http.Reque
 		return "", fmt.Errorf("failed to store new token: %w", err)
 	}
 
-	// Determine if request is secure for cookie Secure flag
-	isSecure := p.session.SecureForRequest(r)
+	// Determine if request is secure for cookie Secure flag. RequestIsHTTPS is
+	// the single source of truth shared with GetBaseURL, so the cookie Secure
+	// flag matches the derived base-URL scheme.
+	isSecure := p.session.SecureForRequest(handlerutils.RequestIsHTTPS(r))
 
 	// Encrypt and set access token cookie
 	encryptedAccessToken, err := encryption.EncryptCookie(p.encryptionKey, newAccessToken)

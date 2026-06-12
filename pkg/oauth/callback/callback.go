@@ -136,7 +136,7 @@ func (p *Handler) setEncryptedCookie(w http.ResponseWriter, r *http.Request, nam
 		Path:     "/",
 		MaxAge:   maxAge,
 		HttpOnly: true,
-		Secure:   p.session.SecureForRequest(r),
+		Secure:   p.session.SecureForRequest(handlerutils.RequestIsHTTPS(r)),
 		SameSite: p.session.SameSite,
 	}
 
