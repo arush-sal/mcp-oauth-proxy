@@ -12,7 +12,9 @@ MCP OAuth Proxy acts as a bridge between OAuth providers (Google, Microsoft, Git
 - **OAuth 2.1 Compliance** - Full OAuth 2.1 authorization server with PKCE support
 - **MCP Integration** - Seamless proxy to MCP servers with user context injection
 - **Multi-Provider Support** - Works with any OAuth 2.0 provider via auto-discovery
+- **Access Control** - Optional email / domain / group allowlist enforced directly against the identity provider, deny-by-default when configured (see [Authorization](/getting-started#authorization--allowlist))
 - **Database Flexibility** - PostgreSQL for production, SQLite for development
+- **Observability** - Liveness / readiness probes and optional Prometheus metrics
 
 ## Architecture
 
@@ -51,6 +53,17 @@ These headers allow your MCP server to:
 :::note
 Headers are only set if the corresponding user information is available from the OAuth provider. If a property is not available, the header is removed to avoid stale data.
 :::
+
+:::info
+**Who reaches the upstream is configurable.** By default any user the OAuth provider authenticates is forwarded. Once you configure an allowlist (`ALLOWED_EMAILS`, `ALLOWED_EMAIL_DOMAINS`, `ALLOWED_GROUPS`, `ALLOWED_GOOGLE_HOSTED_DOMAINS`), access becomes **deny-by-default**: only matching users reach the MCP server, everyone else gets a `403`. See [Authorization & allowlist](/getting-started#authorization--allowlist).
+:::
+
+The proxy always strips any inbound `Authorization` header and overwrites the four `X-Forwarded-*` headers above, so a client cannot spoof them. You can additionally:
+
+- **Forward the OIDC ID token** (a verifiable JWT) to the upstream for downstream validation (e.g. Grafana `[auth.jwt]`) with `AUTHORIZATION_HEADER_TOKEN` / `ID_TOKEN_HEADER`.
+- **Strip a broader set of inbound identity headers** (`X-Auth-Request-*`, `X-Forwarded-Groups`, `X-Remote-User`, ...) with `STRIP_INBOUND_IDENTITY_HEADERS`.
+
+See [Forwarding identity to the upstream](/getting-started#forwarding-identity-to-the-upstream).
 
 ## Next Steps
 

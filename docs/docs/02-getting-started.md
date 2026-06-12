@@ -148,6 +148,10 @@ docker run -d --name mcp-oauth-proxy -p 8080:8080 \
 | `MCP_SERVER_URL`      | ✅       | Your MCP server endpoint                                  |
 | `DATABASE_DSN`        | ❌       | Database connection string (defaults to SQLite)           |
 | `ENCRYPTION_KEY`      | ✅       | Base64-encoded 32-byte AES key                            |
+| `OAUTH_JWKS_URL`      | ❌       | Provider JWKS endpoint; enables OIDC `id_token` verification (needed for group / Google `hd` allowlist rules) |
+| `OAUTH_ISSUER_URL`    | ❌       | Expected `id_token` issuer (`iss`). Overrides the issuer derived from `OAUTH_AUTHORIZE_URL`; required for path-based issuers such as Keycloak (`https://host/realms/x`) |
+
+The options below are all optional and grouped by area; see the dedicated sections that follow for details. Defaults preserve the proxy's previous behavior **except** the authorization allowlist, which is deny-by-default once any allow rule is set.
 
 :::note
 You can generate a random encryption key using the following command:
@@ -177,6 +181,73 @@ DATABASE_DSN="postgresql://postgres:postgres@localhost:5432/oauth-proxy"
 ```
 
 :::
+
+## Authorization & allowlist
+
+By default the proxy forwards **any** user the OAuth provider authenticates. To restrict who may use it, configure one or more allow rules. As soon as **any** rule is set, access becomes **deny-by-default** (oauth2-proxy parity): a request must match at least one rule, otherwise it is rejected with a clear `403`.
+
+| Variable                        | Required | Description                                                                                     |
+| ------------------------------- | -------- | ----------------------------------------------------------------------------------------------- |
+| `ALLOWED_EMAILS`                | ❌       | Comma-separated list of allowed email addresses (case-insensitive)                              |
+| `ALLOWED_EMAILS_FILE`           | ❌       | Path to a file of allowed emails, one per line (blank lines and `#` comments ignored)           |
+| `ALLOWED_EMAIL_DOMAINS`         | ❌       | Comma-separated list of allowed email domains. The special value `*` allows **any** authenticated user |
+| `ALLOWED_GROUPS`                | ❌       | Comma-separated list of allowed groups (matched against the `id_token` groups claim)            |
+| `GROUPS_CLAIM`                  | ❌       | `id_token` claim that carries the user's groups (default `groups`)                              |
+| `ALLOWED_GOOGLE_HOSTED_DOMAINS` | ❌       | Comma-separated list of allowed Google hosted domains (checked against the `hd` claim)          |
+
+Rules are OR-combined. Email and domain rules require a **verified** email (`email_verified == true`). Group and Google hosted-domain rules read claims from the verified OIDC `id_token`, so they require `OAUTH_JWKS_URL` to be set (and `OAUTH_ISSUER_URL` for path-based issuers).
+
+:::warning
+**Breaking change vs. earlier versions.** When no allow rule is configured the proxy now denies all authenticated users. To keep the previous "any authenticated user" behavior, set `ALLOWED_EMAIL_DOMAINS=*` explicitly. An empty allowlist file with no other rule denies everyone (fail-closed).
+:::
+
+:::tip Recipe: drop Keycloak, point at Google directly
+Set `OAUTH_AUTHORIZE_URL=https://accounts.google.com`, supply your Google `OAUTH_CLIENT_ID` / `OAUTH_CLIENT_SECRET`, and add `ALLOWED_EMAILS="you@example.com,teammate@example.com"`. Listed users connect; everyone else gets a `403` — no separate identity broker required.
+:::
+
+The allowlist is enforced at login and re-checked on every token refresh, so a user removed from the list loses access on their next refresh.
+
+## Forwarding identity to the upstream
+
+The proxy always deletes any inbound `Authorization` header and sets the `X-Forwarded-User/Email/Name/Access-Token` headers from the validated session. The options below tune what else is sent.
+
+| Variable                         | Required | Description                                                                                                  |
+| -------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `AUTHORIZATION_HEADER_TOKEN`     | ❌       | Token to place on the upstream `Authorization` header: `none` (default), `access_token`, or `id_token`        |
+| `ID_TOKEN_HEADER`                | ❌       | Custom header to carry the raw verified `id_token` (no `Bearer ` prefix). When empty and forwarding the id_token, `Authorization: Bearer <id_token>` is used |
+| `STRIP_INBOUND_IDENTITY_HEADERS` | ❌       | When `true`, strip client-supplied identity headers (`X-Forwarded-*`, `X-Auth-Request-*`, `X-Remote-*`, the configured `ID_TOKEN_HEADER`) before forwarding, so a caller cannot spoof identity. Default `false` |
+
+Colliding configurations are rejected at startup (e.g. routing two tokens to the same header). A stale/expired `id_token` is never forwarded. Forwarding the `id_token` is useful for upstreams that validate JWTs themselves (e.g. Grafana `[auth.jwt]`).
+
+## Session & cookie lifetime
+
+Token and cookie lifetimes plus cookie security attributes are configurable. Defaults reproduce the previous behavior (1 hour access, 30 day refresh, `Secure` auto-detected, `SameSite=Lax`).
+
+| Variable          | Required | Description                                                                                          |
+| ----------------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `COOKIE_EXPIRE`   | ❌       | Access-token / access-cookie lifetime as a Go duration (e.g. `30m`, `1h`). Default `1h`; minimum `1s` |
+| `COOKIE_REFRESH`  | ❌       | Refresh-token / refresh-cookie lifetime and grant expiry as a Go duration. Default `720h` (30 days)   |
+| `COOKIE_SECURE`   | ❌       | `Secure` attribute policy: `auto` (default, secure when the request is HTTPS), `true`, or `false`     |
+| `COOKIE_SAMESITE` | ❌       | `SameSite` attribute: `lax` (default), `strict`, or `none` (`none` requires `COOKIE_SECURE=true`)     |
+
+## Health & metrics
+
+| Variable          | Required | Description                                                                                       |
+| ----------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `HEALTH_PATH`     | ❌       | Liveness probe path, returns `200` unconditionally (default `/healthz`)                            |
+| `READY_PATH`      | ❌       | Readiness probe path, returns `200` when the database is reachable else `503` (default `/readyz`)  |
+| `ENABLE_METRICS`  | ❌       | Enable the Prometheus metrics endpoint (default `false`)                                           |
+| `METRICS_PATH`    | ❌       | Path for the Prometheus metrics endpoint (default `/metrics`)                                      |
+| `METRICS_ADDRESS` | ❌       | When set (e.g. `:9090`), serve metrics on a separate listener at this address instead of the main mux |
+
+Probes are mounted unauthenticated at the root, so they are unaffected by any route prefix; the legacy `/health` endpoint keeps working. Metrics expose `http_requests_total` and `http_request_duration_seconds` plus standard Go/process collectors.
+
+## Advanced configuration
+
+| Variable                             | Required | Description                                                                                                   |
+| ------------------------------------ | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | ❌       | Allow clients to self-register via `/register` (RFC 7591). Default `true`. When `false`, `/register` returns `403`, the metadata omits the registration endpoint, and already-registered clients keep working |
+| `TRUST_FORWARDED_HEADERS`            | ❌       | Trust `X-Mcp-Oauth-Proxy-URL` / `X-Forwarded-Proto` when building the external base URL (redirect URIs, metadata, `WWW-Authenticate`). Default `true`. Set `false` when the proxy is **not** behind a trusted reverse proxy; the base URL is then derived from the connection (TLS) and the request `Host`, which should itself be constrained at the infrastructure layer |
 
 ## Verification
 
