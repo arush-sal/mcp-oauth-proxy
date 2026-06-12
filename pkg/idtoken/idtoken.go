@@ -46,6 +46,13 @@ type Claims struct {
 	HostedDomain string `json:"hd,omitempty"`
 	// Subject is the "sub" claim.
 	Subject string `json:"sub,omitempty"`
+	// ExpiresAt is the id_token's OWN "exp" claim as Unix seconds, surfaced from
+	// the verified RegisteredClaims so callers can cheaply re-check staleness
+	// without re-parsing the raw JWT. This is the ID TOKEN's exp, which is
+	// DISTINCT from the IdP access-token expiry (tokenInfo.Expiry). Zero when the
+	// token carried no exp (Verify requires exp, so a verified token always has a
+	// non-zero value here).
+	ExpiresAt int64 `json:"exp,omitempty"`
 }
 
 // UnmarshalJSON decodes Claims, tolerating the "groups" claim arriving as
@@ -59,6 +66,7 @@ func (c *Claims) UnmarshalJSON(data []byte) error {
 		Groups        groupsValue `json:"groups,omitempty"`
 		HostedDomain  string      `json:"hd,omitempty"`
 		Subject       string      `json:"sub,omitempty"`
+		ExpiresAt     int64       `json:"exp,omitempty"`
 	}
 	var a alias
 	if err := json.Unmarshal(data, &a); err != nil {
@@ -69,6 +77,7 @@ func (c *Claims) UnmarshalJSON(data []byte) error {
 	c.Groups = []string(a.Groups)
 	c.HostedDomain = a.HostedDomain
 	c.Subject = a.Subject
+	c.ExpiresAt = a.ExpiresAt
 	return nil
 }
 
@@ -296,12 +305,21 @@ func (v *Verifier) Verify(ctx context.Context, rawIDToken string) (*Claims, erro
 		return nil, fmt.Errorf("idtoken: %w", err)
 	}
 
+	// Surface the id_token's OWN exp (validated above via WithExpirationRequired)
+	// so callers can cheaply re-check staleness without re-parsing the raw JWT.
+	// This is the ID TOKEN's exp, distinct from the IdP access-token expiry.
+	var expiresAt int64
+	if jc.ExpiresAt != nil {
+		expiresAt = jc.ExpiresAt.Unix()
+	}
+
 	return &Claims{
 		Email:         jc.Email,
 		EmailVerified: jc.EmailVerified,
 		Groups:        groups,
 		HostedDomain:  jc.HostedDomain,
 		Subject:       jc.Subject,
+		ExpiresAt:     expiresAt,
 	}, nil
 }
 

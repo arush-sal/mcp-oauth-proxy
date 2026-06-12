@@ -152,7 +152,6 @@ func TestStripEnabledForwardAuthMode(t *testing.T) {
 // forwarding + stripping enabled, a spoofed inbound ID_TOKEN_HEADER value is
 // removed and the real (non-stale) id_token is then written.
 func TestStripEnabledWithForwardingWritesRealIDToken(t *testing.T) {
-	validIDToken := makeIDToken(t, time.Now().Add(1*time.Hour))
 	p := newForwardProxy(t, &types.Config{
 		StripInboundIdentityHeaders: true,
 		IDTokenHeader:               "X-Id-Token",
@@ -163,12 +162,13 @@ func TestStripEnabledWithForwardingWritesRealIDToken(t *testing.T) {
 	header.Set("X-Forwarded-Groups", "admins")
 
 	props := stripProps()
-	props["id_token"] = validIDToken
+	props["id_token"] = idTokenValue
+	props["id_token_exp"] = time.Now().Add(1 * time.Hour).Unix()
 	p.setHeaders(header, props)
 
 	// Spoofed broad header gone; real id_token written to the custom header.
 	assert.Empty(t, header.Get("X-Forwarded-Groups"))
-	assert.Equal(t, validIDToken, header.Get("X-Id-Token"))
+	assert.Equal(t, idTokenValue, header.Get("X-Id-Token"))
 }
 
 // TestStripEnabledProxyDirector exercises the reverse-proxy Director path
@@ -185,7 +185,6 @@ func TestStripEnabledProxyDirector(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	validIDToken := makeIDToken(t, time.Now().Add(1*time.Hour))
 	p := newForwardProxy(t, &types.Config{
 		Mode:                        ModeProxy,
 		MCPServerURL:                upstream.URL,
@@ -199,7 +198,8 @@ func TestStripEnabledProxyDirector(t *testing.T) {
 	target, err := url.Parse(upstream.URL)
 	require.NoError(t, err)
 	props := stripProps()
-	props["id_token"] = validIDToken
+	props["id_token"] = idTokenValue
+	props["id_token_exp"] = time.Now().Add(1 * time.Hour).Unix()
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
@@ -220,5 +220,5 @@ func TestStripEnabledProxyDirector(t *testing.T) {
 	assert.Empty(t, gotGroups)
 	assert.Empty(t, gotAuthReqEmail)
 	assert.Equal(t, "user@example.com", gotFwdEmail)
-	assert.Equal(t, validIDToken, gotIDToken)
+	assert.Equal(t, idTokenValue, gotIDToken)
 }

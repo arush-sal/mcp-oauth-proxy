@@ -315,6 +315,11 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		sensitiveProps["id_token_claims"] = string(claimsJSON)
 		sensitiveProps["id_token"] = rawIDToken
+		// Store the id_token's OWN exp (Unix seconds) so the forwarding staleness
+		// check can avoid re-parsing the raw JWT per request. This is the id_token
+		// exp, DISTINCT from sensitiveProps["expires_at"] (the IdP access-token
+		// expiry, tokenInfo.Expiry).
+		sensitiveProps["id_token_exp"] = idTokenClaims.ExpiresAt
 	}
 
 	// Only add user info if we have it

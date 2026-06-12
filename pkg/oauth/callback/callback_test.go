@@ -139,6 +139,46 @@ func TestCallback_StoresVerifiedIDTokenClaims(t *testing.T) {
 	assert.Equal(t, "raw-id-token", props["id_token"])
 }
 
+func TestCallback_StoresIDTokenExpDistinctFromAccessTokenExpiry(t *testing.T) {
+	// The stored id_token_exp must be the ID TOKEN's OWN exp (from the verified
+	// claims), NOT the IdP access-token expiry (tokenInfo.Expiry, stored under
+	// expires_at). The two are deliberately different here to catch any
+	// conflation.
+	accessExp := time.Now().Add(30 * time.Minute) // IdP access-token expiry
+	idTokenExp := time.Now().Add(2 * time.Hour)   // id_token's own exp (different)
+
+	store := &fakeStore{authRequest: map[string]any{"client_id": "client", "scope": "openid"}}
+	token := (&oauth2.Token{AccessToken: "at", Expiry: accessExp}).
+		WithExtra(map[string]any{"id_token": "raw-id-token"})
+	provider := &fakeProvider{token: token}
+	verifier := &stubVerifier{claims: &idtoken.Claims{
+		Email:     "user@example.com",
+		Subject:   "user-123",
+		ExpiresAt: idTokenExp.Unix(),
+	}}
+
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", verifier, allowAny(t), defaultSession())
+
+	rec, req := newCallbackRequest(t)
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	props := decryptGrantProps(t, store.storedGrant)
+
+	// id_token_exp is the id_token's own exp (round-tripped through JSON as a
+	// float64).
+	gotIDExp, ok := props["id_token_exp"].(float64)
+	require.True(t, ok, "id_token_exp should be stored as a number")
+	assert.Equal(t, idTokenExp.Unix(), int64(gotIDExp))
+
+	// expires_at is the access-token expiry and must remain DISTINCT.
+	gotAccessExp, ok := props["expires_at"].(float64)
+	require.True(t, ok, "expires_at should be stored as a number")
+	assert.Equal(t, accessExp.Unix(), int64(gotAccessExp))
+	assert.NotEqual(t, int64(gotIDExp), int64(gotAccessExp),
+		"id_token_exp must not be conflated with the access-token expires_at")
+}
+
 func TestCallback_NoIDTokenLeavesPropsUnchanged(t *testing.T) {
 	store := &fakeStore{authRequest: map[string]any{"client_id": "client", "scope": "openid"}}
 	// Token carries no id_token extra.

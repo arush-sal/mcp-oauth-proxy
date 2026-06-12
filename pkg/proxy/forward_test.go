@@ -1,8 +1,6 @@
 package proxy
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
@@ -12,20 +10,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// makeIDToken builds an UNSIGNED (alg=none) JWT carrying the given exp. The
-// forwarding staleness check parses exp WITHOUT verification (the token was
-// already verified when stored), so an unsigned token is sufficient for tests.
-func makeIDToken(t *testing.T, exp time.Time) string {
-	t.Helper()
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
-	body, err := json.Marshal(map[string]any{
-		"sub": "user123",
-		"exp": exp.Unix(),
-	})
-	require.NoError(t, err)
-	payload := base64.RawURLEncoding.EncodeToString(body)
-	return header + "." + payload + "."
-}
+// idTokenValue is an opaque raw id_token string used by the forwarding tests.
+// Staleness is no longer decided by parsing this value; it is driven entirely by
+// props["id_token_exp"] (the id_token's OWN exp captured at store time), so the
+// raw token here can be any non-empty marker.
+const idTokenValue = "raw.id.token"
 
 func newForwardProxy(t *testing.T, cfg *types.Config) *OAuthProxy {
 	t.Helper()
@@ -39,16 +28,19 @@ func newForwardProxy(t *testing.T, cfg *types.Config) *OAuthProxy {
 }
 
 func TestSetHeadersForwarding(t *testing.T) {
-	validIDToken := makeIDToken(t, time.Now().Add(1*time.Hour))
-	expiredIDToken := makeIDToken(t, time.Now().Add(-1*time.Hour))
+	futureExp := time.Now().Add(1 * time.Hour).Unix()
+	pastExp := time.Now().Add(-1 * time.Hour).Unix()
 
+	// baseProps carries a valid (future-exp) id_token. Staleness is driven by
+	// props["id_token_exp"], not by parsing the raw token.
 	baseProps := func() map[string]any {
 		return map[string]any{
 			"user_id":      "user123",
 			"email":        "user@example.com",
 			"name":         "John Doe",
 			"access_token": "access-abc",
-			"id_token":     validIDToken,
+			"id_token":     idTokenValue,
+			"id_token_exp": futureExp,
 		}
 	}
 
@@ -76,7 +68,7 @@ func TestSetHeadersForwarding(t *testing.T) {
 		header := make(http.Header)
 		p.setHeaders(header, baseProps())
 
-		assert.Equal(t, "Bearer "+validIDToken, header.Get("Authorization"))
+		assert.Equal(t, "Bearer "+idTokenValue, header.Get("Authorization"))
 		assert.Empty(t, header.Get("X-Id-Token"))
 	})
 
@@ -85,14 +77,14 @@ func TestSetHeadersForwarding(t *testing.T) {
 		header := make(http.Header)
 		p.setHeaders(header, baseProps())
 
-		assert.Equal(t, validIDToken, header.Get("X-Id-Token"))
+		assert.Equal(t, idTokenValue, header.Get("X-Id-Token"))
 		assert.Empty(t, header.Get("Authorization"))
 	})
 
 	t.Run("ExpiredIDTokenNotForwardedAuthorization", func(t *testing.T) {
 		p := newForwardProxy(t, &types.Config{AuthorizationHeaderToken: "id_token"})
 		props := baseProps()
-		props["id_token"] = expiredIDToken
+		props["id_token_exp"] = pastExp
 		header := make(http.Header)
 		p.setHeaders(header, props)
 
@@ -102,11 +94,23 @@ func TestSetHeadersForwarding(t *testing.T) {
 	t.Run("ExpiredIDTokenNotForwardedCustomHeader", func(t *testing.T) {
 		p := newForwardProxy(t, &types.Config{IDTokenHeader: "X-Id-Token"})
 		props := baseProps()
-		props["id_token"] = expiredIDToken
+		props["id_token_exp"] = pastExp
 		header := make(http.Header)
 		p.setHeaders(header, props)
 
 		assert.Empty(t, header.Get("X-Id-Token"))
+	})
+
+	t.Run("MissingExpIDTokenNotForwarded", func(t *testing.T) {
+		// A stored id_token with NO recorded exp must fail closed (not forwarded),
+		// even though the raw token is present.
+		p := newForwardProxy(t, &types.Config{AuthorizationHeaderToken: "id_token"})
+		props := baseProps()
+		delete(props, "id_token_exp")
+		header := make(http.Header)
+		p.setHeaders(header, props)
+
+		assert.Empty(t, header.Get("Authorization"))
 	})
 
 	t.Run("AbsentIDTokenNotForwarded", func(t *testing.T) {
@@ -141,7 +145,7 @@ func TestSetHeadersForwarding(t *testing.T) {
 	t.Run("ExpiredIDTokenClearsSpoofedAuthorization", func(t *testing.T) {
 		p := newForwardProxy(t, &types.Config{AuthorizationHeaderToken: "id_token"})
 		props := baseProps()
-		props["id_token"] = expiredIDToken
+		props["id_token_exp"] = pastExp
 		header := make(http.Header)
 		header.Set("Authorization", "Bearer spoofed-inbound")
 		p.setHeaders(header, props)
@@ -156,7 +160,7 @@ func TestSetHeadersForwarding(t *testing.T) {
 		// inbound value must NOT survive into the upstream request.
 		p := newForwardProxy(t, &types.Config{IDTokenHeader: "X-Id-Token"})
 		props := baseProps()
-		props["id_token"] = expiredIDToken
+		props["id_token_exp"] = pastExp
 		header := make(http.Header)
 		header.Set("X-Id-Token", "spoofed.jwt.value")
 		p.setHeaders(header, props)
@@ -180,7 +184,7 @@ func TestSetHeadersForwarding(t *testing.T) {
 		// the spoofed inbound Authorization must be gone.
 		p := newForwardProxy(t, &types.Config{AuthorizationHeaderToken: "id_token"})
 		props := baseProps()
-		props["id_token"] = expiredIDToken
+		props["id_token_exp"] = pastExp
 		header := make(http.Header)
 		header.Set("Authorization", "Bearer spoofed.jwt.value")
 		p.setHeaders(header, props)
@@ -281,18 +285,34 @@ func TestValidateForwardingConfig(t *testing.T) {
 	}
 }
 
-// TestForwardingTokenExpiry exercises the staleness helper directly.
+// TestForwardingTokenExpiry exercises the staleness helper directly. Staleness
+// is read from props["id_token_exp"] (the id_token's OWN exp, Unix seconds),
+// NOT from props["expires_at"] (the access-token expiry). It fails closed for a
+// missing/zero/past/wrong-typed exp.
 func TestForwardingTokenExpiry(t *testing.T) {
-	t.Run("Valid", func(t *testing.T) {
-		assert.False(t, idTokenExpired(makeIDToken(t, time.Now().Add(time.Hour))))
+	t.Run("ValidFloat64", func(t *testing.T) {
+		// JSON-decoded props deliver numbers as float64.
+		assert.False(t, idTokenStale(map[string]any{"id_token_exp": float64(time.Now().Add(time.Hour).Unix())}))
+	})
+	t.Run("ValidInt64", func(t *testing.T) {
+		// In-process props (e.g. forward_auth) may carry an int64.
+		assert.True(t, !idTokenStale(map[string]any{"id_token_exp": time.Now().Add(time.Hour).Unix()}))
 	})
 	t.Run("Expired", func(t *testing.T) {
-		assert.True(t, idTokenExpired(makeIDToken(t, time.Now().Add(-time.Hour))))
+		assert.True(t, idTokenStale(map[string]any{"id_token_exp": float64(time.Now().Add(-time.Hour).Unix())}))
 	})
-	t.Run("Garbage", func(t *testing.T) {
-		assert.True(t, idTokenExpired("not-a-jwt"))
+	t.Run("Missing", func(t *testing.T) {
+		assert.True(t, idTokenStale(map[string]any{"id_token": idTokenValue}))
 	})
-	t.Run("Empty", func(t *testing.T) {
-		assert.True(t, idTokenExpired(""))
+	t.Run("Zero", func(t *testing.T) {
+		assert.True(t, idTokenStale(map[string]any{"id_token_exp": float64(0)}))
+	})
+	t.Run("WrongType", func(t *testing.T) {
+		assert.True(t, idTokenStale(map[string]any{"id_token_exp": "not-a-number"}))
+	})
+	t.Run("IgnoresAccessTokenExpiresAt", func(t *testing.T) {
+		// A future access-token expires_at must NOT make a missing id_token_exp
+		// look fresh: the two are distinct values.
+		assert.True(t, idTokenStale(map[string]any{"expires_at": float64(time.Now().Add(time.Hour).Unix())}))
 	})
 }

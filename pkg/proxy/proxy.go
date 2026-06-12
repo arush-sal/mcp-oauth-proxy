@@ -955,6 +955,11 @@ func (p *OAuthProxy) reauthorizeOnRefresh(ctx context.Context, oldProps map[stri
 			if claimsJSON, mErr := json.Marshal(claims); mErr == nil {
 				props["id_token_claims"] = string(claimsJSON)
 				props["id_token"] = rawIDToken
+				// Refresh the stored id_token exp alongside the token so the
+				// forwarding staleness check uses the fresh token's OWN exp
+				// (Unix seconds), distinct from props["expires_at"] (the IdP
+				// access-token expiry).
+				props["id_token_exp"] = claims.ExpiresAt
 			}
 		}
 	}
