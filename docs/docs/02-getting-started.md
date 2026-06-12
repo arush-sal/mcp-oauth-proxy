@@ -209,6 +209,15 @@ Set `OAUTH_AUTHORIZE_URL=https://accounts.google.com`, supply your Google `OAUTH
 
 The allowlist is enforced at login and re-checked on every token refresh, so a user removed from the list loses access on their next refresh.
 
+:::note Revocation-latency contract
+Re-evaluation happens at refresh time, not per request, so revocation is bounded by the token TTLs, not instantaneous:
+
+- **Allowlist config change**: browser/cookie clients re-check near access-token expiry and on the `refresh_token` grant (about `COOKIE_EXPIRE`, default 1h). Bearer (Authorization-header) API clients have no cookie refresh, so they are re-checked only when the proxy refreshes the upstream IdP token — a de-authorized API client keeps access until that IdP token's TTL elapses.
+- **IdP-side membership change** (group / `hd` removed at the provider): observed only when a refresh returns a fresh `id_token`; the cookie refresh re-authorizes against stored claims until then.
+
+Lower `COOKIE_EXPIRE` (and your IdP's access-token lifetime) for tighter bounds. Immediate, per-request revocation is intentionally out of scope.
+:::
+
 ## Forwarding identity to the upstream
 
 The proxy always deletes any inbound `Authorization` header and sets the `X-Forwarded-User/Email/Name/Access-Token` headers from the validated session. The options below tune what else is sent.
