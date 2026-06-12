@@ -62,7 +62,8 @@ func TestReauthorizeOnRefresh_NoLongerMatching(t *testing.T) {
 func TestReauthorizeOnRefresh_FreshIDTokenUpdatesClaimsAndAllows(t *testing.T) {
 	// Old stored claims are out of date (denied); a fresh id_token brings the
 	// user back into the allowlist and the stored claims are refreshed.
-	v := &stubVerifier{claims: &idtoken.Claims{Email: "user@example.com", EmailVerified: true}}
+	idTokenExp := time.Now().Add(2 * time.Hour).Unix()
+	v := &stubVerifier{claims: &idtoken.Claims{Email: "user@example.com", EmailVerified: true, ExpiresAt: idTokenExp}}
 	p := newProxyWithAuthz(t, authz.Config{EmailDomains: []string{"example.com"}}, v)
 
 	old := storedPropsWithClaims(t, idtoken.Claims{Email: "user@removed.com", EmailVerified: true})
@@ -76,6 +77,9 @@ func TestReauthorizeOnRefresh_FreshIDTokenUpdatesClaimsAndAllows(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(newProps["id_token_claims"].(string)), &claims))
 	assert.Equal(t, "user@example.com", claims.Email)
 	assert.Equal(t, "fresh-id-token", newProps["id_token"])
+	// The refresh writer must also persist the id_token's own exp (guards the
+	// second props["id_token"] writer independently of the forwarding tests).
+	assert.Equal(t, idTokenExp, newProps["id_token_exp"], "refresh must store the fresh id_token exp")
 }
 
 func TestReauthorizeOnRefresh_FreshIDTokenInvalidFailsClosed(t *testing.T) {

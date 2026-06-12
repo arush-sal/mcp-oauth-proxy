@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 )
 
@@ -186,10 +185,11 @@ func resolveForwardConfig(cfg *types.Config) (forwardConfig, error) {
 //   - id_token -> Authorization: "Authorization: Bearer <id_token>".
 //   - id_token -> custom header: the raw id_token verbatim (no "Bearer " prefix).
 //
-// Expiry safety: an absent, malformed, or expired id_token is NEVER forwarded;
-// the destination header is left absent. The id_token was already verified when
-// stored, so a lightweight unverified exp parse is sufficient (and necessary,
-// since verification needs JWKS) to decide staleness here.
+// Expiry safety: an absent or expired id_token is NEVER forwarded; the
+// destination header is left absent. The id_token's OWN exp was captured at
+// store time (props["id_token_exp"], Unix seconds) by the verifier, so the
+// staleness decision here is a cheap timestamp comparison rather than a
+// per-request JWT re-parse.
 func (f forwardConfig) applyForwarding(header http.Header, props map[string]any) {
 	switch f.authToken {
 	case authHeaderTokenAccessToken:
@@ -221,10 +221,11 @@ func (f forwardConfig) setIDToken(header http.Header, dst string, props map[stri
 		log.Printf("debug: not forwarding id_token: none stored on grant")
 		return
 	}
-	if idTokenExpired(rawIDToken) {
-		// F1 refreshes the stored id_token on IdP refresh; if the IdP did not
-		// issue a fresh one, forwarding stops here rather than sending a stale
-		// token.
+	if idTokenStale(props) {
+		// F1 refreshes the stored id_token (and its exp) on IdP refresh; if the
+		// IdP did not issue a fresh one, forwarding stops here rather than
+		// sending a stale token. Fail closed: a missing/zero/past exp is treated
+		// as stale.
 		log.Printf("debug: not forwarding id_token to %q: stored token is expired", dst)
 		return
 	}
@@ -235,23 +236,31 @@ func (f forwardConfig) setIDToken(header http.Header, dst string, props map[stri
 	header.Set(dst, rawIDToken)
 }
 
-// idTokenExpired reports whether the JWT's exp is in the past (or cannot be
-// parsed). It performs an UNVERIFIED parse of the claims: the token was already
-// cryptographically verified by the idtoken verifier when it was stored on the
-// grant, so re-verifying here (which would require JWKS) is unnecessary; we only
-// need exp to avoid forwarding a stale token. A token that cannot be parsed, or
-// has no exp, is treated as expired (fail closed: do not forward).
-func idTokenExpired(rawIDToken string) bool {
-	if rawIDToken == "" {
+// idTokenStale reports whether the stored id_token is expired (or its expiry is
+// unknown), using the id_token's OWN exp captured at store time under
+// props["id_token_exp"] (Unix seconds). This avoids re-parsing the raw JWT on
+// every forwarded request: the token was already cryptographically verified by
+// the idtoken verifier when stored, and its exp was surfaced then.
+//
+// IMPORTANT: this reads id_token_exp, NOT props["expires_at"] — the latter is
+// the IdP ACCESS-token expiry (tokenInfo.Expiry), a DIFFERENT value. Conflating
+// them would forward a stale id_token (or drop a fresh one).
+//
+// Fail closed: a missing, non-numeric, zero, or past exp is treated as stale so
+// nothing is forwarded. JSON-decoded props deliver numbers as float64, but an
+// int64 (in-process props, e.g. forward_auth) is also accepted.
+func idTokenStale(props map[string]any) bool {
+	var exp int64
+	switch v := props["id_token_exp"].(type) {
+	case float64:
+		exp = int64(v)
+	case int64:
+		exp = v
+	default:
 		return true
 	}
-	parser := jwt.NewParser()
-	claims := jwt.RegisteredClaims{}
-	if _, _, err := parser.ParseUnverified(rawIDToken, &claims); err != nil {
+	if exp <= 0 {
 		return true
 	}
-	if claims.ExpiresAt == nil {
-		return true
-	}
-	return !claims.ExpiresAt.After(time.Now())
+	return !time.Unix(exp, 0).After(time.Now())
 }

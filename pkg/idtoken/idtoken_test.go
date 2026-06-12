@@ -120,6 +120,22 @@ func TestVerify_ValidToken(t *testing.T) {
 	assert.Empty(t, claims.HostedDomain)
 }
 
+func TestVerify_PopulatesExpiresAt(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+	v := newTestVerifier(t, srv.URL)
+
+	exp := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	c := baseClaims()
+	c["exp"] = exp.Unix()
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, c)
+
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	require.NotNil(t, claims)
+	assert.Equal(t, exp.Unix(), claims.ExpiresAt)
+}
+
 func TestVerify_WrongAudience(t *testing.T) {
 	key := newTestKey(t)
 	srv := jwksServer(t, key, testKID)
