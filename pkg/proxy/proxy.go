@@ -62,6 +62,13 @@ type OAuthProxy struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// idtokenSleep and idtokenBuild are test seams for buildIDTokenVerifier so
+	// the startup retry loop can be exercised without real sleeps or network
+	// access. When nil they default to time.Sleep and a real
+	// idtoken.MaybeNewVerifier call. Production never sets these.
+	idtokenSleep func(time.Duration)
+	idtokenBuild func() (callback.IDTokenVerifier, error)
 }
 
 const (
@@ -230,13 +237,126 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 	return p, nil
 }
 
+// defaultVerifierRetry is the startup retry policy for building the id_token
+// verifier: a handful of attempts with exponential backoff, capped per-attempt.
+// With base 500ms, factor 2 and a 5s cap the per-attempt BACKOFF waits are
+// 500ms, 1s, 2s, 4s (the 5th attempt needs no wait), i.e. ~7.5s of backoff.
+//
+// Each attempt may ALSO spend up to the JWKS HTTP timeout
+// (idtoken.defaultJWKSHTTPTimeout, ~10s) actually fetching the JWKS before it
+// fails, so the worst-case boot delay when the endpoint hangs is roughly
+// 5*10s (fetches) + 7.5s (backoff) ~= 57s before degrading-with-warning.
+// Connection-refused/500 responses fail fast, so the common transient-outage
+// case is dominated by the ~7.5s of backoff. The HTTP timeout bounds the hung
+// case so boot cannot block indefinitely.
+var defaultVerifierRetry = retryKnobs{
+	attempts: 5,
+	base:     500 * time.Millisecond,
+	factor:   2,
+	cap:      5 * time.Second,
+}
+
+// retryKnobs configures buildVerifierWithRetry's exponential backoff. It is a
+// small struct so tests can dial the schedule down (and inject a fake sleeper)
+// to run without real sleeps.
+type retryKnobs struct {
+	attempts int           // total build attempts (>= 1)
+	base     time.Duration // first backoff wait
+	factor   int           // multiplier applied to the wait each attempt
+	cap      time.Duration // per-attempt wait ceiling
+}
+
+// backoffFor returns the wait to use BEFORE the (attempt+1)-th retry, i.e. the
+// wait after a failed attempt at zero-based index `attempt`. It grows
+// base*factor^attempt, clamped to cap. Kept pure so the schedule is unit
+// testable without sleeping.
+func (k retryKnobs) backoffFor(attempt int) time.Duration {
+	wait := k.base
+	for i := 0; i < attempt; i++ {
+		wait *= time.Duration(k.factor)
+		if k.cap > 0 && wait >= k.cap {
+			return k.cap
+		}
+	}
+	if k.cap > 0 && wait > k.cap {
+		return k.cap
+	}
+	return wait
+}
+
+// buildVerifierWithRetry calls build up to knobs.attempts times, sleeping
+// between failed attempts using the exponential backoff schedule and the
+// injected sleep func. It stops early (returning ctx.Err) if ctx is cancelled,
+// so shutdown aborts the loop. On the first success it returns the verifier;
+// after the last failed attempt it returns the final build error. Injecting
+// sleep and build keeps it fully unit-testable without real sleeps or network.
+func buildVerifierWithRetry(ctx context.Context, knobs retryKnobs, sleep func(time.Duration), build func() (callback.IDTokenVerifier, error)) (callback.IDTokenVerifier, error) {
+	if knobs.attempts < 1 {
+		knobs.attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < knobs.attempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			return nil, lastErr
+		}
+
+		verifier, err := build()
+		switch {
+		case err != nil:
+			lastErr = err
+		case verifier == nil:
+			// A nil verifier with a nil error is NOT success: success must yield
+			// a usable verifier. Treat it as a retryable error so the loop does
+			// not silently return nil as if verification were configured.
+			lastErr = errors.New("idtoken: build returned a nil verifier without an error")
+		default:
+			return verifier, nil
+		}
+
+		// No backoff after the final attempt.
+		if attempt == knobs.attempts-1 {
+			break
+		}
+
+		// Wait for the backoff OR context cancellation, whichever comes first,
+		// so a shutdown during the wait aborts promptly instead of blocking for
+		// the full backoff. The injected sleep runs in a goroutine and signals
+		// when it returns; ctx.Done races against it.
+		done := make(chan struct{})
+		go func() {
+			sleep(knobs.backoffFor(attempt))
+			close(done)
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+		}
+	}
+	return nil, lastErr
+}
+
 // buildIDTokenVerifier constructs the OIDC id_token verifier from the provider
 // parameters in config: the issuer is derived from the OAuth authorize URL
 // origin, the JWKS URL comes from config, and the expected audience is the
 // OAuth client ID. It returns a true nil interface (not a typed nil) when the
 // verifier cannot or should not be built, so the callback treats it as "no
-// id_token verification". This keeps startup working for non-OIDC setups (no
-// JWKS URL) and degrades gracefully if the verifier cannot be constructed.
+// id_token verification".
+//
+// Behavior:
+//   - Non-OIDC setup (issuer/JWKS/client ID not all present): MaybeNewVerifier
+//     would return (nil, nil), so there is nothing to build. Return nil
+//     immediately with no retry and no warning.
+//   - OIDC params present but the build fails (e.g. a JWKS blip at startup):
+//     retry with exponential backoff. If every attempt fails, log a WARNING
+//     that id_token verification is DISABLED for this process (security impact)
+//     and degrade to nil rather than hard-exiting.
+//   - When a verifier is built and OAUTH_ISSUER_URL is empty, the issuer was
+//     derived from the authorize URL's origin, which is wrong for path-based
+//     issuers; emit a WARNING pointing at OAUTH_ISSUER_URL.
 func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
 	// Use the explicitly configured issuer when set (required for path-based
 	// issuers like Keycloak https://host/realms/x); otherwise derive it from the
@@ -246,6 +366,13 @@ func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
 		issuer = oidcIssuerFromAuthorizeURL(p.config.OAuthAuthorizeURL)
 	}
 
+	// A verifier is only EXPECTED when all OIDC params are present; this mirrors
+	// MaybeNewVerifier's (nil, nil) guard. When any is missing this is a
+	// non-OIDC setup: return nil immediately with no retry and no warning.
+	if issuer == "" || p.config.OAuthJWKSURL == "" || p.config.OAuthClientID == "" {
+		return nil
+	}
+
 	// Bind the verifier's JWKS background refresh to the proxy-owned context so
 	// it is cancelled in Close rather than leaking against context.Background().
 	ctx := p.ctx
@@ -253,23 +380,58 @@ func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
 		ctx = context.Background()
 	}
 
-	verifier, err := idtoken.MaybeNewVerifier(ctx, idtoken.Config{
-		Issuer:      issuer,
-		JWKSURL:     p.config.OAuthJWKSURL,
-		Audience:    p.config.OAuthClientID,
-		GroupsClaim: p.config.GroupsClaim,
-	})
+	build := p.idtokenBuild
+	if build == nil {
+		build = func() (callback.IDTokenVerifier, error) {
+			v, err := idtoken.MaybeNewVerifier(ctx, idtoken.Config{
+				Issuer:      issuer,
+				JWKSURL:     p.config.OAuthJWKSURL,
+				Audience:    p.config.OAuthClientID,
+				GroupsClaim: p.config.GroupsClaim,
+			})
+			if err != nil {
+				return nil, err
+			}
+			// Params are present (checked above), so MaybeNewVerifier should
+			// always return a non-nil verifier. A nil verifier with a nil error
+			// here is unexpected/defensive: surface it as an ERROR so the retry
+			// loop retries and ultimately emits the DISABLED warning, rather
+			// than treating it as silent success.
+			if v == nil {
+				return nil, fmt.Errorf("idtoken: MaybeNewVerifier returned a nil verifier despite OIDC params being present (issuer=%s)", issuer)
+			}
+			return v, nil
+		}
+	}
+
+	sleep := p.idtokenSleep
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+
+	verifier, err := buildVerifierWithRetry(ctx, defaultVerifierRetry, sleep, build)
 	if err != nil {
-		// The parameters were present but the verifier could not be built
-		// (e.g. JWKS endpoint unreachable at startup). Degrade to "no id_token
-		// verification" rather than failing startup.
-		log.Printf("id_token verifier not configured: %v", err)
+		// Every attempt failed. Degrade rather than hard-exit, but make the
+		// security impact loud: with no verifier, group/hosted-domain allowlist
+		// rules can never match and email rules lose signature/iss/aud checks.
+		log.Printf("WARNING: id_token verification is DISABLED for this process: failed to build the OIDC id_token verifier after retries: %v. "+
+			"Group and hosted-domain authorization rules will not match and email rules lose signature/issuer/audience guarantees. "+
+			"Restart once the JWKS endpoint (%s) is reachable.", err, p.config.OAuthJWKSURL)
 		return nil
 	}
 	if verifier == nil {
-		// Non-OIDC setup (missing issuer/JWKS/client ID): no verification.
+		// Defensive: params were present so this is unexpected, but treat it as
+		// no verification rather than returning a typed nil.
 		return nil
 	}
+
+	// The issuer was derived (no explicit override). Warn that this is wrong for
+	// path-based issuers so operators can set OAUTH_ISSUER_URL if logins fail.
+	if p.config.OAuthIssuerURL == "" {
+		log.Printf("WARNING: the expected id_token issuer was derived from OAUTH_AUTHORIZE_URL's origin (%q) and may be wrong for path-based issuers "+
+			"(e.g. Keycloak https://host/realms/x, Azure AD v2 tenant). Set OAUTH_ISSUER_URL explicitly if logins fail with an issuer-mismatch.", issuer)
+	}
+
 	return verifier
 }
 
