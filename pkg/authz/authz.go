@@ -137,7 +137,7 @@ func (a *Authorizer) Enabled() bool {
 //  2. email in the allowed emails set (case-insensitive; requires EmailVerified).
 //  3. email's domain in the allowed domains set (case-insensitive; requires EmailVerified).
 //  4. user's groups intersect the allowed groups.
-//  5. hosted domain ("hd") in the allowed Google hosted domains.
+//  5. hosted domain ("hd") in the allowed Google hosted domains (requires EmailVerified).
 //
 // With no rules configured, none of the above can match, so the zero-config
 // authorizer denies everything (fail-closed default).
@@ -172,7 +172,10 @@ func (a *Authorizer) Authorize(id Identity) error {
 		}
 	}
 
-	if len(a.hostedDomain) > 0 && id.HostedDomain != "" {
+	// The Google hosted-domain rule, like the email/domain rules, requires a
+	// verified email: a source populating "hd" for an unverified account must
+	// not be authorized.
+	if id.EmailVerified && len(a.hostedDomain) > 0 && id.HostedDomain != "" {
 		if _, ok := a.hostedDomain[strings.ToLower(strings.TrimSpace(id.HostedDomain))]; ok {
 			return nil
 		}

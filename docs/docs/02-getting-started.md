@@ -195,7 +195,9 @@ By default the proxy forwards **any** user the OAuth provider authenticates. To 
 | `GROUPS_CLAIM`                  | ❌       | `id_token` claim that carries the user's groups (default `groups`)                              |
 | `ALLOWED_GOOGLE_HOSTED_DOMAINS` | ❌       | Comma-separated list of allowed Google hosted domains (checked against the `hd` claim)          |
 
-Rules are OR-combined. Email and domain rules require a **verified** email (`email_verified == true`). Group and Google hosted-domain rules read claims from the verified OIDC `id_token`, so they require `OAUTH_JWKS_URL` to be set (and `OAUTH_ISSUER_URL` for path-based issuers).
+Rules are OR-combined. Email, domain, and Google hosted-domain (`hd`) rules require a **verified** email (`email_verified == true`). Group and Google hosted-domain rules read claims from the verified OIDC `id_token`, so they require `OAUTH_JWKS_URL` to be set (and `OAUTH_ISSUER_URL` for path-based issuers).
+
+When verifying an `id_token`, a multi-valued `aud` claim additionally requires the `azp` (authorized party) claim to be present and equal to the OAuth client ID (OIDC Core 3.1.3.7); a single-valued `aud` does not require `azp`.
 
 :::warning
 **Breaking change vs. earlier versions.** When no allow rule is configured the proxy now denies all authenticated users. To keep the previous "any authenticated user" behavior, set `ALLOWED_EMAIL_DOMAINS=*` explicitly. An empty allowlist file with no other rule denies everyone (fail-closed).
