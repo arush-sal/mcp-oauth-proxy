@@ -315,6 +315,31 @@ receives a `401`; browser sessions are sent back through login). When a refresh
 returns a fresh `id_token` it is re-verified and the stored claims are updated
 before the re-check; otherwise the stored claims (or userinfo) are used.
 
+#### Revocation-latency contract
+
+Re-evaluation happens at refresh time, not on every request, so revocation is
+not instantaneous. The latency depends on the client type and on *what* changed:
+
+- **Allowlist config change** (you edit `ALLOWED_EMAILS`/`ALLOWED_*` and
+  restart, or change a watched file): for **browser/cookie** clients the
+  proxy re-checks when the access token is within ~15 minutes of expiry and on
+  the standard `refresh_token` grant, so access ends within roughly the access
+  TTL (`COOKIE_EXPIRE`, default 1h). For **bearer (Authorization-header) API**
+  clients there is no cookie refresh — the allowlist is re-checked only when the
+  proxy refreshes the upstream IdP token (i.e. when the stored IdP access token
+  is near expiry), so a de-authorized API client retains access until that IdP
+  token's TTL elapses.
+- **IdP-side membership change** (a user is removed from a group, or their `hd`
+  changes, at the identity provider): this is only observed once **fresh claims**
+  arrive, which happens when a refresh returns a new `id_token`. The cookie
+  refresh path re-authorizes against the **stored** grant claims, so an IdP group
+  removal is not seen until the next IdP-token refresh brings updated claims.
+
+In short: revocation is bounded by the access-token / IdP-token TTLs, not
+immediate. For tighter bounds, lower `COOKIE_EXPIRE` (and your IdP's access-token
+lifetime). Immediate revocation would require per-request re-validation, which is
+intentionally out of scope.
+
 ### `OAUTH_ISSUER_URL`
 
 When verifying the IdP `id_token`, the expected issuer (`iss`) defaults to the
