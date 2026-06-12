@@ -45,17 +45,25 @@ type SessionConfig struct {
 	SameSite http.SameSite
 }
 
-// SecureForRequest reports whether the Secure attribute should be set for the
-// given request under this policy. In auto mode it preserves the historical
-// isSecureRequest behavior (TLS set OR X-Forwarded-Proto: https).
-func (sc SessionConfig) SecureForRequest(r *http.Request) bool {
+// SecureForRequest maps this tri-state Secure policy over a pre-resolved
+// "is this request https" bool: Always => true, Never => false, Auto =>
+// requestIsHTTPS.
+//
+// requestIsHTTPS is computed by the caller via handlerutils.RequestIsHTTPS,
+// which is the SINGLE SOURCE OF TRUTH for the https decision (it accounts for
+// r.TLS, the trusted X-Mcp-Oauth-Proxy-URL scheme, and X-Forwarded-Proto). This
+// package deliberately does not import handlerutils (to keep the foundational
+// types package dependency-free) and no longer re-derives any part of that rule
+// itself, so the cookie Secure flag and the handlerutils-derived base URL cannot
+// drift apart.
+func (sc SessionConfig) SecureForRequest(requestIsHTTPS bool) bool {
 	switch sc.CookieSecure {
 	case CookieSecureAlways:
 		return true
 	case CookieSecureNever:
 		return false
 	default: // CookieSecureAuto
-		return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+		return requestIsHTTPS
 	}
 }
 

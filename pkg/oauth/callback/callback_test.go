@@ -11,6 +11,7 @@ import (
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/authz"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/idtoken"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
@@ -530,6 +531,107 @@ func TestCallback_CookieSecureAutoOnHTTPS(t *testing.T) {
 	access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
 	require.NotNil(t, access)
 	assert.True(t, access.Secure, "auto Secure on HTTPS request")
+}
+
+// TestCallback_CookieSecureAutoTrustForwarded verifies that in auto mode the
+// cookie Secure flag respects the trust-forwarded policy: a spoofed
+// X-Forwarded-Proto: https (no TLS) flips Secure on only when forwarded headers
+// are trusted, and is ignored when they are not.
+func TestCallback_CookieSecureAutoTrustForwarded(t *testing.T) {
+	newReq := func() (*httptest.ResponseRecorder, *http.Request, *fakeStore) {
+		rec, req, store := uiCallbackRequest(t, false) // plain HTTP, no TLS
+		req.Header.Set("X-Forwarded-Proto", "https")   // client-supplied (spoofable)
+		return rec, req, store
+	}
+
+	t.Run("Trusted_HonorsForwardedProto", func(t *testing.T) {
+		provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+		rec, req, store := newReq()
+		req = req.WithContext(handlerutils.WithTrustForwarded(req.Context(), true))
+		h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+		h.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusFound, rec.Code)
+		access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
+		require.NotNil(t, access)
+		assert.True(t, access.Secure, "trusted: X-Forwarded-Proto: https flips Secure on")
+	})
+
+	t.Run("Untrusted_IgnoresSpoofedForwardedProto", func(t *testing.T) {
+		provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+		rec, req, store := newReq()
+		req = req.WithContext(handlerutils.WithTrustForwarded(req.Context(), false))
+		h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+		h.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusFound, rec.Code)
+		access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
+		require.NotNil(t, access)
+		assert.False(t, access.Secure, "untrusted: spoofed X-Forwarded-Proto must not flip Secure")
+	})
+}
+
+// TestCallback_CookieSecureMatchesProxyURLScheme is the peer-review blocker:
+// a trusted X-Mcp-Oauth-Proxy-URL: https://ext.example on a plain-HTTP request
+// (no TLS, no X-Forwarded-Proto) yields an https base URL, so in auto mode the
+// cookie Secure flag MUST also be true. With trust disabled the header is
+// ignored and the cookie is not Secure.
+func TestCallback_CookieSecureMatchesProxyURLScheme(t *testing.T) {
+	newReq := func() (*httptest.ResponseRecorder, *http.Request, *fakeStore) {
+		rec, req, store := uiCallbackRequest(t, false) // plain HTTP, no TLS, no XFP
+		req.Header.Set("X-Mcp-Oauth-Proxy-URL", "https://ext.example")
+		return rec, req, store
+	}
+
+	t.Run("Trusted_ProxyURLHTTPS_SecureCookie", func(t *testing.T) {
+		provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+		rec, req, store := newReq()
+		req = req.WithContext(handlerutils.WithTrustForwarded(req.Context(), true))
+		h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+		h.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusFound, rec.Code)
+		access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
+		require.NotNil(t, access)
+		assert.True(t, access.Secure, "trusted https X-Mcp-Oauth-Proxy-URL must make the cookie Secure")
+		refresh := findCookie(rec.Result().Cookies(), types.RefreshTokenCookieName)
+		require.NotNil(t, refresh)
+		assert.True(t, refresh.Secure, "trusted https X-Mcp-Oauth-Proxy-URL must make the refresh cookie Secure")
+	})
+
+	t.Run("Untrusted_IgnoresProxyURL_NotSecure", func(t *testing.T) {
+		provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+		rec, req, store := newReq()
+		req = req.WithContext(handlerutils.WithTrustForwarded(req.Context(), false))
+		h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+		h.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusFound, rec.Code)
+		access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
+		require.NotNil(t, access)
+		assert.False(t, access.Secure, "untrusted X-Mcp-Oauth-Proxy-URL must not flip Secure on")
+	})
+}
+
+// TestCallback_CookieSecureMatchesHTTPProxyURLOverTLS is BLOCKER 1 at the
+// callback level: a TLS request (uiCallbackRequest secure) carrying a trusted
+// http:// X-Mcp-Oauth-Proxy-URL declares an http external URL, so the cookie
+// Secure flag MUST be false to match the http base URL GetBaseURL returns.
+func TestCallback_CookieSecureMatchesHTTPProxyURLOverTLS(t *testing.T) {
+	provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+	rec, req, store := uiCallbackRequest(t, true) // TLS request
+	req.Header.Set("X-Mcp-Oauth-Proxy-URL", "http://ext.example")
+	req = req.WithContext(handlerutils.WithTrustForwarded(req.Context(), true))
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code)
+	access := findCookie(rec.Result().Cookies(), types.AccessTokenCookieName)
+	require.NotNil(t, access)
+	assert.False(t, access.Secure, "trusted http X-Mcp-Oauth-Proxy-URL over TLS => http base URL => cookie NOT Secure")
+	refresh := findCookie(rec.Result().Cookies(), types.RefreshTokenCookieName)
+	require.NotNil(t, refresh)
+	assert.False(t, refresh.Secure, "refresh cookie must also be NOT Secure")
 }
 
 func TestCallback_TokenDBExpiryReflectsCustomConfig(t *testing.T) {
