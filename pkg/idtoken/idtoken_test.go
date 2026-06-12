@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -386,4 +387,82 @@ func TestClaims_UnmarshalGroups(t *testing.T) {
 			assert.Equal(t, tc.want, c.Groups)
 		})
 	}
+}
+
+// TestNewVerifier_UnreachableJWKS_ReturnsError asserts that when the JWKS
+// endpoint is unreachable/failing at construction time, NewVerifier surfaces a
+// non-nil ERROR (rather than a nil-error verifier with an empty key cache).
+// This is what lets the proxy's startup retry loop actually retry. See the
+// keyfunc/jwkset NoErrorReturnFirstHTTPReq behavior.
+func TestNewVerifier_UnreachableJWKS_ReturnsError(t *testing.T) {
+	t.Run("500 response", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(srv.Close)
+
+		v, err := NewVerifier(context.Background(), Config{
+			Issuer:   testIssuer,
+			JWKSURL:  srv.URL,
+			Audience: testAudience,
+		})
+		require.Error(t, err, "expected an error when the JWKS endpoint returns 500")
+		require.Nil(t, v, "verifier must be nil when the initial JWKS fetch fails")
+	})
+
+	t.Run("connection refused", func(t *testing.T) {
+		// Bind a listener then close it so the port is (almost certainly) refused.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		url := "http://" + ln.Addr().String() + "/jwks"
+		require.NoError(t, ln.Close())
+
+		// Bound the client so a hung/refused endpoint cannot block boot.
+		v, err := NewVerifier(context.Background(), Config{
+			Issuer:     testIssuer,
+			JWKSURL:    url,
+			Audience:   testAudience,
+			HTTPClient: &http.Client{Timeout: 2 * time.Second},
+		})
+		require.Error(t, err, "expected an error when the JWKS endpoint is unreachable")
+		require.Nil(t, v)
+	})
+}
+
+// TestMaybeNewVerifier_UnreachableJWKS_ReturnsError mirrors the above through
+// MaybeNewVerifier (params present), which is the entry point the proxy uses.
+func TestMaybeNewVerifier_UnreachableJWKS_ReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	v, err := MaybeNewVerifier(context.Background(), Config{
+		Issuer:   testIssuer,
+		JWKSURL:  srv.URL,
+		Audience: testAudience,
+	})
+	require.Error(t, err)
+	require.Nil(t, v)
+}
+
+// TestNewVerifier_ReachableJWKS_HappyPath confirms that when JWKS IS reachable
+// the verifier is built successfully (first fetch succeeds) and can verify a
+// token, i.e. surfacing the initial-fetch error did not break the happy path.
+func TestNewVerifier_ReachableJWKS_HappyPath(t *testing.T) {
+	key := newTestKey(t)
+	srv := jwksServer(t, key, testKID)
+
+	v, err := NewVerifier(context.Background(), Config{
+		Issuer:   testIssuer,
+		JWKSURL:  srv.URL,
+		Audience: testAudience,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, v)
+
+	raw := signToken(t, key, testKID, jwt.SigningMethodRS256, baseClaims())
+	claims, err := v.Verify(context.Background(), raw)
+	require.NoError(t, err)
+	assert.Equal(t, "user@example.com", claims.Email)
 }

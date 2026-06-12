@@ -22,8 +22,12 @@ import (
 	"net/http"
 	"time"
 
+	"log/slog"
+
+	"github.com/MicahParks/jwkset"
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/time/rate"
 )
 
 // Claims is the normalized subset of OIDC id_token claims that this proxy
@@ -121,6 +125,16 @@ type Config struct {
 // GroupsClaim is configured.
 const DefaultGroupsClaim = "groups"
 
+// defaultJWKSHTTPTimeout bounds the JWKS HTTP fetch (both the initial fetch and
+// each background refresh) so a hung endpoint cannot block startup unboundedly.
+// The proxy's startup retry loop layers a small number of attempts on top of
+// this, keeping worst-case boot delay bounded.
+const defaultJWKSHTTPTimeout = 10 * time.Second
+
+// jwksRefreshInterval is how often the background goroutine re-fetches the JWKS
+// so rotated signing keys are picked up without a restart.
+const jwksRefreshInterval = time.Hour
+
 // Verifier verifies IdP-issued id_tokens and extracts normalized Claims.
 type Verifier struct {
 	issuer      string
@@ -144,14 +158,7 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 		return nil, fmt.Errorf("idtoken: audience is required")
 	}
 
-	override := keyfunc.Override{
-		HTTPTimeout: 30 * time.Second,
-	}
-	if cfg.HTTPClient != nil {
-		override.Client = cfg.HTTPClient
-	}
-
-	kf, err := keyfunc.NewDefaultOverrideCtx(ctx, []string{cfg.JWKSURL}, override)
+	kf, err := newJWKSKeyfunc(ctx, cfg.JWKSURL, cfg.HTTPClient)
 	if err != nil {
 		return nil, fmt.Errorf("idtoken: failed to build JWKS key function: %w", err)
 	}
@@ -180,6 +187,63 @@ func MaybeNewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 		return nil, nil
 	}
 	return NewVerifier(ctx, cfg)
+}
+
+// newJWKSKeyfunc builds a keyfunc.Keyfunc backed by an HTTP JWKS storage that
+// refreshes in the background.
+//
+// IMPORTANT: unlike keyfunc.NewDefaultOverrideCtx (which hardcodes
+// jwkset.HTTPClientStorageOptions.NoErrorReturnFirstHTTPReq = true and would
+// return a working-looking verifier with an EMPTY key cache when the JWKS
+// endpoint is unreachable at startup), this constructs the storage with
+// NoErrorReturnFirstHTTPReq = false so a failed INITIAL fetch surfaces as an
+// error. That error is what lets the proxy's startup retry loop actually retry
+// a transient JWKS outage and then degrade-with-warning if it never recovers,
+// instead of silently failing at token-verify time.
+//
+// The HTTP fetch (initial and each refresh) is bounded by a timeout so a hung
+// endpoint cannot block startup unboundedly. Once the first fetch succeeds, a
+// background goroutine (ended when ctx is cancelled) keeps the keys fresh.
+func newJWKSKeyfunc(ctx context.Context, jwksURL string, client *http.Client) (keyfunc.Keyfunc, error) {
+	if client == nil {
+		client = &http.Client{Timeout: defaultJWKSHTTPTimeout}
+	}
+
+	// Mirror keyfunc.NewDefaultOverrideCtx's refresh-error logging so background
+	// refresh failures remain visible, while keeping NoErrorReturnFirstHTTPReq
+	// false so the INITIAL fetch failure is returned to the caller.
+	refreshErrorHandler := func(ctx context.Context, err error) {
+		slog.Default().ErrorContext(ctx, "Failed to refresh HTTP JWK Set from remote HTTP resource.",
+			"error", err,
+			"url", jwksURL,
+		)
+	}
+
+	storage, err := jwkset.NewStorageFromHTTP(jwksURL, jwkset.HTTPClientStorageOptions{
+		Client:                    client,
+		Ctx:                       ctx,
+		HTTPTimeout:               defaultJWKSHTTPTimeout,
+		NoErrorReturnFirstHTTPReq: false,
+		RefreshErrorHandler:       refreshErrorHandler,
+		RefreshInterval:           jwksRefreshInterval,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	clientStorage, err := jwkset.NewHTTPClient(jwkset.HTTPClientOptions{
+		HTTPURLs:          map[string]jwkset.Storage{jwksURL: storage},
+		RateLimitWaitMax:  time.Minute,
+		RefreshUnknownKID: rate.NewLimiter(rate.Every(5*time.Minute), 1),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return keyfunc.New(keyfunc.Options{
+		Ctx:     ctx,
+		Storage: clientStorage,
+	})
 }
 
 // Verify verifies the signature, issuer, audience, and expiry of rawIDToken and
