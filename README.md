@@ -359,6 +359,16 @@ rule (rules OR together); otherwise it is denied with a clear `403`
 > equal to the OAuth client ID (OIDC Core 3.1.3.7). A single-valued `aud` does
 > not require `azp`.
 
+> [!WARNING]
+> **Don't combine `ALLOWED_EMAIL_DOMAINS` with `ALLOWED_GOOGLE_HOSTED_DOMAINS`
+> expecting both to be required.** Allow rules are OR-combined. The email-domain
+> rule matches on the email **suffix**, while the Google hosted-domain rule
+> matches the signed, unspoofable `hd` claim. Setting both lets an account whose
+> email merely ends in the domain — but which is **not** in the Workspace —
+> through. For a hard Workspace boundary use `ALLOWED_GOOGLE_HOSTED_DOMAINS`
+> **alone** (or an explicit `ALLOWED_EMAILS` list); do not pair it with
+> `ALLOWED_EMAIL_DOMAINS`.
+
 ### Re-checked on every refresh
 
 The allowlist is re-evaluated on **every token refresh**. If a previously
@@ -399,6 +409,13 @@ When verifying the IdP `id_token`, the expected issuer (`iss`) defaults to the
 origin (`scheme://host`) of `OAUTH_AUTHORIZE_URL`. For providers with a
 path-based issuer (e.g. Keycloak `https://host/realms/your-realm`), set
 `OAUTH_ISSUER_URL` to the exact issuer string; it overrides the derived value.
+
+The expected issuer is matched **exactly** against the token's `iss`. Set
+`OAUTH_ISSUER_URL` to precisely the string your provider emits — validate it
+against a real id_token from staging before production. For Google this is
+`https://accounts.google.com`; note Google has historically also emitted the
+scheme-less form `accounts.google.com`, so if verification fails closed with an
+issuer mismatch, confirm the exact `iss` your tenant returns.
 
 ### Recipe: drop Keycloak, point at Google directly
 

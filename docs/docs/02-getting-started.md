@@ -200,6 +200,14 @@ Rules are OR-combined. Email, domain, and Google hosted-domain (`hd`) rules requ
 When verifying an `id_token`, a multi-valued `aud` claim additionally requires the `azp` (authorized party) claim to be present and equal to the OAuth client ID (OIDC Core 3.1.3.7); a single-valued `aud` does not require `azp`.
 
 :::warning
+**Do not pair `ALLOWED_EMAIL_DOMAINS` with `ALLOWED_GOOGLE_HOSTED_DOMAINS` expecting both to hold.** Allow rules are OR-combined. `ALLOWED_EMAIL_DOMAINS` matches the email **suffix**, while `ALLOWED_GOOGLE_HOSTED_DOMAINS` matches the signed, unspoofable `hd` claim. Setting both admits an account whose email merely ends in the domain but is **not** in the Workspace. For a hard Workspace boundary use `ALLOWED_GOOGLE_HOSTED_DOMAINS` alone (or an explicit `ALLOWED_EMAILS` list).
+:::
+
+:::note
+**Validate `OAUTH_ISSUER_URL` against a real token.** The expected issuer is matched exactly against the token's `iss`; set it to precisely what your provider emits and confirm with a staging id_token. For Google this is `https://accounts.google.com` (it has historically also emitted the scheme-less `accounts.google.com`), so if logins fail closed with an issuer mismatch, check the exact `iss` your tenant returns.
+:::
+
+:::warning
 **Breaking change vs. earlier versions.** When no allow rule is configured the proxy now denies all authenticated users. To keep the previous "any authenticated user" behavior, set `ALLOWED_EMAIL_DOMAINS=*` explicitly. An empty allowlist file with no other rule denies everyone (fail-closed).
 :::
 
