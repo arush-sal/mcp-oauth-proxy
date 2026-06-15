@@ -116,6 +116,28 @@ type Config struct {
 	// the registration endpoint; pre-existing stored clients keep working.
 	EnableDynamicClientRegistration *bool
 
+	// MaxDynamicClients caps how many Dynamic Client Registration clients may
+	// exist at once (M1). When DCR is enabled, /register counts existing
+	// DCR-registered clients before storing and rejects a new registration once
+	// the count is at/over this cap, preventing an unauthenticated attacker from
+	// filling the database. The default is a finite value (see
+	// DefaultMaxDynamicClients) so the protection is ON by default; a value of 0
+	// means "unlimited" and must be set explicitly. Negative values are treated
+	// as the default by ResolvedMaxDynamicClients.
+	//
+	// NOTE for programmatic/embedding callers: the zero value is 0 == "unlimited".
+	// To get the finite secure default, set this to -1 (the CLI does this), or
+	// call ResolvedMaxDynamicClients. A zero-valued Config with DCR enabled is
+	// therefore uncapped unless you opt in.
+	MaxDynamicClients int
+
+	// DynamicClientTTL is the lifetime of a DCR-registered client (M1). When > 0,
+	// a registered client expires at issued_at + TTL: it is rejected by the
+	// authorize/token client lookup once expired and is garbage-collected by the
+	// periodic cleanup. The default is 0 = no expiry (back-compat); statically
+	// provisioned clients are never given a TTL regardless of this value.
+	DynamicClientTTL time.Duration
+
 	// TrustForwardedHeaders controls whether client-supplied forwarded headers
 	// (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto) are trusted when deriving the
 	// external base URL, which feeds redirect URIs, OAuth metadata, and the
@@ -162,6 +184,22 @@ type Config struct {
 // (nil) value defaults to false.
 func (c *Config) DCREnabled() bool {
 	return c.EnableDynamicClientRegistration != nil && *c.EnableDynamicClientRegistration
+}
+
+// DefaultMaxDynamicClients is the finite default cap on DCR-registered clients
+// (M1). It is intentionally finite so the anti-DB-fill protection is ON by
+// default; operators opt into "unlimited" by setting MaxDynamicClients to 0.
+const DefaultMaxDynamicClients = 100
+
+// ResolvedMaxDynamicClients returns the effective cap on DCR-registered
+// clients. A negative (unset) value resolves to DefaultMaxDynamicClients so the
+// protection is on by default; 0 is honored verbatim as "unlimited"; any
+// positive value is used as-is.
+func (c *Config) ResolvedMaxDynamicClients() int {
+	if c.MaxDynamicClients < 0 {
+		return DefaultMaxDynamicClients
+	}
+	return c.MaxDynamicClients
 }
 
 // TrustForwardedHeadersEnabled reports whether client-supplied forwarded

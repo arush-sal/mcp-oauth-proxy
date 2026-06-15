@@ -85,6 +85,15 @@ type RootCmd struct {
 	// existing stored clients keep working.
 	EnableDynamicClientRegistration bool `name:"enable-dynamic-client-registration" env:"ENABLE_DYNAMIC_CLIENT_REGISTRATION" usage:"Allow clients to self-register via the /register endpoint (RFC 7591). When false, /register returns 403 and metadata omits the registration endpoint; existing clients keep working" default:"false"`
 
+	// DCR abuse bounds (M1). MaxDynamicClients caps how many DCR-registered
+	// clients may exist at once; the default is finite so the protection is on by
+	// default, and 0 means unlimited. DynamicClientTTL expires DCR-registered
+	// clients after issued_at+TTL (rejected at lookup and garbage-collected);
+	// default 0 means no expiry. A negative MaxDynamicClients (the flag default)
+	// resolves to the finite built-in default.
+	MaxDynamicClients int           `name:"max-dynamic-clients" env:"MAX_DYNAMIC_CLIENTS" usage:"Maximum number of Dynamic Client Registration clients allowed at once. When DCR is enabled, /register rejects new registrations once this many DCR clients exist. 0 means unlimited; the default is finite so the protection is on by default" default:"-1"`
+	DynamicClientTTL  time.Duration `name:"dynamic-client-ttl" env:"DYNAMIC_CLIENT_TTL" usage:"Lifetime of a DCR-registered client (e.g. 720h). When >0, a registered client expires at issued_at+TTL: it is rejected by the authorize/token lookup once expired and is garbage-collected. Default 0 means no expiry; statically provisioned clients are never expired" default:"0"`
+
 	// Trust forwarded headers (follow-up #2). Default true preserves today's
 	// behavior (honors X-Mcp-Oauth-Proxy-URL / X-Forwarded-Proto). When false,
 	// the proxy does NOT trust those forwarded headers; the external base URL
@@ -165,6 +174,8 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		MetricsAddress: c.MetricsAddress,
 
 		EnableDynamicClientRegistration: &c.EnableDynamicClientRegistration,
+		MaxDynamicClients:               c.MaxDynamicClients,
+		DynamicClientTTL:                c.DynamicClientTTL,
 
 		TrustForwardedHeaders: &c.TrustForwardedHeaders,
 

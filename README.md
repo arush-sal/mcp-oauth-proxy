@@ -152,6 +152,8 @@ export ENCRYPTION_KEY="your-encryption-key"
 | `METRICS_PATH`              | ❌ | Path for the Prometheus metrics endpoint. Default `/metrics` |
 | `METRICS_ADDRESS`           | ❌ | When set (e.g. `:9090`), serve metrics on a **separate** listener at this address instead of the main server. When empty and `ENABLE_METRICS=true`, metrics are served on the main server at `METRICS_PATH` |
 | `ENABLE_DYNAMIC_CLIENT_REGISTRATION` | ❌ | Allow clients to self-register via the `/register` endpoint (RFC 7591). Default `false`. When `false`, `/register` returns `403` and the authorization-server metadata omits `registration_endpoint`; existing clients keep working. See "Dynamic Client Registration" |
+| `MAX_DYNAMIC_CLIENTS`       | ❌ | Maximum number of Dynamic Client Registration clients allowed at once. When DCR is enabled, `/register` rejects new registrations with `429` once this many DCR clients exist (does not store). **Default `100`** so the anti-DB-fill protection is on by default; set to `0` for **unlimited**. Statically/pre-registered clients are never counted against this cap. See "Dynamic Client Registration" |
+| `DYNAMIC_CLIENT_TTL`        | ❌ | Lifetime of a DCR-registered client as a Go duration (e.g. `720h`). When `> 0`, a registered client expires at `issued_at + TTL`: an expired `client_id` is rejected by the `/authorize` and `/token` client lookup (`invalid_client`) and the client is garbage-collected by the periodic cleanup. **Default `0` = no expiry** (back-compat). Statically/pre-registered clients are never given a TTL and are never GC'd. See "Dynamic Client Registration" |
 | `EXTERNAL_BASE_URL`         | ❌ | Authoritative external base URL of the proxy (e.g. `https://auth.example.com`). When set, it **overrides and ignores** the client-supplied `X-Mcp-Oauth-Proxy-URL` and `X-Forwarded-Proto` headers entirely when deriving the external base URL (which feeds redirect URIs, OAuth metadata, and the `WWW-Authenticate` `resource_metadata`) **and** the automatic cookie `Secure` decision (the scheme is taken from this URL), **regardless of `TRUST_FORWARDED_HEADERS`**. Must be an absolute `http`/`https` URL with a host and no path/query/fragment (validated at startup). **Recommended** behind a load balancer (e.g. an ALB) that does not strip arbitrary client-supplied headers, since those forwarded headers are otherwise spoofable |
 | `XFF_TRUSTED_HOP_COUNT`     | ❌ | Number of trusted proxy hops in front of this server, used to pick the per-IP rate-limit client IP from `X-Forwarded-For` (only when `TRUST_FORWARDED_HEADERS=true`). The `X-Forwarded-For` chain is appended left-to-right, so the **rightmost** entries are added by the closest trusted proxies: with `N` hops the real client IP is the entry `N` positions from the **right**, and spoofed client-supplied entries to the left are ignored. Default `0` trusts **no** `X-Forwarded-For` entry and uses `RemoteAddr`, so a single spoofed `X-Forwarded-For` cannot rotate the rate-limit key. **Warning:** leaving this unset (`0`) behind a trusted load balancer (e.g. an ALB) collapses **all** clients onto a single rate-limit key (the load balancer's `RemoteAddr`), so one heavy user exhausts the shared quota for everyone. Operators behind a trusted LB **must** set this to their hop count (`1` for a single ALB) for correct, non-spoofable per-client keys. `X-Real-IP` is never used for the key |
 | `TRUST_FORWARDED_HEADERS`   | ❌ | Trust client-supplied forwarded headers (`X-Mcp-Oauth-Proxy-URL`, `X-Forwarded-Proto`, `X-Forwarded-For`). Default `true` preserves behavior. This toggle governs: (1) the external base URL (which feeds redirect URIs, OAuth metadata, and the `WWW-Authenticate` `resource_metadata`), derived from `X-Mcp-Oauth-Proxy-URL` / `X-Forwarded-Proto` — **unless `EXTERNAL_BASE_URL` is set, which takes precedence**; (2) whether `X-Forwarded-For` is consulted for the per-IP rate-limit client IP for `/authorize`, `/token`, `/register` (the specific entry is selected by `XFF_TRUSTED_HOP_COUNT`, default `0` = use `RemoteAddr`); and (3) the automatic cookie `Secure` decision (`COOKIE_SECURE=auto`), derived from `X-Forwarded-Proto` (or from `EXTERNAL_BASE_URL` when set). Set `false` when the proxy is **not** behind a trusted reverse proxy: the proxy then ignores all of those forwarded headers and instead derives the scheme from the connection (TLS), the host from the request `Host` header, and the rate-limit client IP from `RemoteAddr` — so a client cannot spoof `X-Forwarded-For` to rotate the rate-limit key or spoof `X-Forwarded-Proto` to flip the cookie `Secure` flag. Note that the `Host` header itself should be constrained by a fronting reverse proxy / allowed-host config at the infrastructure layer. See also `EXTERNAL_BASE_URL` and `XFF_TRUSTED_HOP_COUNT` |
@@ -290,6 +292,26 @@ consent-phishing / authorization-code interception:
   a missing challenge or `plain` is rejected. The token endpoint also refuses to
   redeem a public-client authorization code that lacks a bound PKCE challenge, so
   PKCE cannot be bypassed. Confidential clients (with a secret) are unaffected.
+
+DCR is also bounded so an unauthenticated caller cannot fill the database:
+
+- **A registration cap is enforced.** `MAX_DYNAMIC_CLIENTS` limits how many
+  DCR-registered clients may exist at once. `/register` runs an efficient count
+  before storing and, once the cap is reached, rejects new registrations with a
+  `429 Too Many Requests` and an `invalid_client_metadata` error **without
+  storing**. The **default is `100`** (finite, so the protection is on by
+  default); set `MAX_DYNAMIC_CLIENTS=0` for unlimited. Statically/pre-registered
+  clients do not count against the cap.
+- **An optional TTL expires stale clients.** When `DYNAMIC_CLIENT_TTL > 0`, each
+  newly registered client is stamped with an expiry of `issued_at + TTL`. An
+  expired `client_id` is treated as not-found by the `/authorize` and `/token`
+  client lookup (`invalid_client`), and a periodic garbage collector — the same
+  hourly cleanup that prunes expired tokens — deletes expired clients. The
+  **default is `0` = no expiry** (back-compat). Only DCR-registered clients get a
+  TTL; statically/pre-registered clients (expiry `0`) are never expired or GC'd.
+- **`/register` is rate-limited.** The endpoint is behind the same per-IP rate
+  limiter as `/authorize` and `/token` (see `TRUST_FORWARDED_HEADERS` /
+  `XFF_TRUSTED_HOP_COUNT` for how the client IP is derived).
 
 ## Authorization / Allowlist
 

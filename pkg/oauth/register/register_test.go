@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"github.com/stretchr/testify/assert"
@@ -33,13 +34,25 @@ func (f *fakeStore) GetClient(clientID string) (*types.ClientInfo, bool) {
 	return c, ok
 }
 
+// CountDynamicClients counts the DCR-registered (Dynamic) clients, mirroring
+// the efficient COUNT the real store performs for the cap check.
+func (f *fakeStore) CountDynamicClients() (int64, error) {
+	var n int64
+	for _, c := range f.clients {
+		if c.Dynamic {
+			n++
+		}
+	}
+	return n, nil
+}
+
 const registerBody = `{"redirect_uris":["https://client.example.com/callback"],"client_name":"Test Client","token_endpoint_auth_method":"none"}`
 
 // TestRegisterEnabledStoresClient verifies the enabled handler registers and
 // persists a client.
 func TestRegisterEnabledStoresClient(t *testing.T) {
 	store := newFakeStore()
-	h := NewHandler(store, true)
+	h := NewHandler(store, true, 0, 0)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
@@ -54,7 +67,7 @@ func TestRegisterEnabledStoresClient(t *testing.T) {
 // and an OAuthError body, and does NOT store anything.
 func TestRegisterDisabledForbidden(t *testing.T) {
 	store := newFakeStore()
-	h := NewHandler(store, false)
+	h := NewHandler(store, false, 0, 0)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
@@ -99,7 +112,7 @@ func TestRegisterRedirectURIValidation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newFakeStore()
-			h := NewHandler(store, true)
+			h := NewHandler(store, true, 0, 0)
 
 			// Build the body with json.Marshal so backslash-containing or
 			// otherwise special URIs are not accidentally malformed by string
@@ -141,7 +154,7 @@ func TestExistingClientStillResolvesWhenDisabled(t *testing.T) {
 	require.NoError(t, store.StoreClient(existing))
 
 	// DCR is disabled: /register is forbidden.
-	h := NewHandler(store, false)
+	h := NewHandler(store, false, 0, 0)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
 	h.ServeHTTP(w, req)
@@ -151,4 +164,83 @@ func TestExistingClientStillResolvesWhenDisabled(t *testing.T) {
 	got, ok := store.GetClient("pre-existing-client")
 	require.True(t, ok, "pre-existing client must still resolve when DCR is disabled")
 	assert.Equal(t, existing.ClientSecret, got.ClientSecret)
+}
+
+// TestRegisterCapEnforced proves the M1 cap: with a cap of N and N DCR clients
+// already present, the (N+1)th /register is rejected and NOT stored; under the
+// cap a registration succeeds and is marked Dynamic so it counts toward the cap.
+func TestRegisterCapEnforced(t *testing.T) {
+	store := newFakeStore()
+	const cap = 2
+	h := NewHandler(store, true, cap, 0)
+
+	register := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	// First two registrations succeed and are stored as Dynamic clients.
+	require.Equal(t, http.StatusOK, register().Code)
+	require.Equal(t, http.StatusOK, register().Code)
+	assert.Len(t, store.clients, cap, "both under-cap registrations should be stored")
+	for _, c := range store.clients {
+		assert.True(t, c.Dynamic, "DCR-registered client must be marked Dynamic")
+	}
+
+	// The third exceeds the cap: rejected, not stored.
+	w := register()
+	require.Equal(t, http.StatusTooManyRequests, w.Code, "body: %s", w.Body.String())
+	assert.Contains(t, w.Body.String(), "limit reached")
+	assert.Len(t, store.clients, cap, "over-cap registration must NOT be stored")
+}
+
+// TestRegisterCapUnlimited proves a cap of 0 means unlimited (no rejection).
+func TestRegisterCapUnlimited(t *testing.T) {
+	store := newFakeStore()
+	h := NewHandler(store, true, 0, 0)
+	for i := 0; i < 5; i++ {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
+		h.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+	}
+	assert.Len(t, store.clients, 5)
+}
+
+// TestRegisterTTLStamped proves a configured TTL stamps the stored client with
+// a future expiry, and a zero TTL leaves it never-expiring (ExpiresAt=0).
+func TestRegisterTTLStamped(t *testing.T) {
+	t.Run("ttl set => future expiry", func(t *testing.T) {
+		store := newFakeStore()
+		h := NewHandler(store, true, 0, time.Hour)
+		before := time.Now().Unix()
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
+		h.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+
+		require.Len(t, store.clients, 1)
+		for _, c := range store.clients {
+			assert.True(t, c.Dynamic)
+			assert.GreaterOrEqual(t, c.ExpiresAt, before+int64(time.Hour.Seconds())-5)
+		}
+	})
+
+	t.Run("ttl zero => never expires", func(t *testing.T) {
+		store := newFakeStore()
+		h := NewHandler(store, true, 0, 0)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
+		h.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+
+		require.Len(t, store.clients, 1)
+		for _, c := range store.clients {
+			assert.Equal(t, int64(0), c.ExpiresAt, "TTL=0 must leave the client never-expiring")
+		}
+	})
 }
