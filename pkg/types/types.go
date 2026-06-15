@@ -2,6 +2,7 @@ package types
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -129,6 +130,32 @@ type Config struct {
 	// header itself should be constrained by a fronting reverse proxy /
 	// allowed-host config at the infrastructure layer.
 	TrustForwardedHeaders *bool
+
+	// ExternalBaseURL (H3, part A) is the AUTHORITATIVE external base URL of the
+	// proxy. When set, it overrides and IGNORES the client-supplied
+	// X-Mcp-Oauth-Proxy-URL and X-Forwarded-Proto headers entirely when deriving
+	// the external base URL (which feeds redirect URIs, OAuth metadata, and the
+	// WWW-Authenticate resource_metadata) AND the cookie-Secure scheme decision,
+	// regardless of TrustForwardedHeaders. This is the recommended setting behind
+	// a load balancer (e.g. an ALB) that does NOT strip arbitrary client-supplied
+	// headers, so those headers are otherwise spoofable. When empty, behavior is
+	// unchanged (trust-gated forwarded headers). It must be a valid absolute
+	// http/https URL with a host and no path/query/fragment; validate via
+	// ValidateExternalBaseURL and read the normalized value via
+	// NormalizedExternalBaseURL.
+	ExternalBaseURL string
+
+	// XFFTrustedHopCount (H3, part B) is the number of trusted proxy hops in
+	// front of this server. It governs which X-Forwarded-For entry is used as the
+	// per-IP rate-limit client IP (GetClientIP), and only applies when forwarded
+	// headers are trusted. The XFF chain is appended left-to-right, so the
+	// RIGHTMOST entries are added by the closest trusted proxies: with N hops the
+	// real client IP is parts[len(parts)-N]; spoofed client-supplied entries sit
+	// to the LEFT and are ignored. N=0 (default) does NOT trust any XFF entry for
+	// the key and uses RemoteAddr, so a single spoofed XFF cannot rotate the key.
+	// Operators behind a trusted LB should set this to their hop count (1 for a
+	// single ALB).
+	XFFTrustedHopCount int
 }
 
 // DCREnabled reports whether Dynamic Client Registration is enabled. An unset
@@ -142,6 +169,56 @@ func (c *Config) DCREnabled() bool {
 // (nil) value defaults to true so existing configs preserve today's behavior.
 func (c *Config) TrustForwardedHeadersEnabled() bool {
 	return c.TrustForwardedHeaders == nil || *c.TrustForwardedHeaders
+}
+
+// ValidateExternalBaseURL validates the configured ExternalBaseURL at startup.
+// An empty value is allowed (feature disabled). When set, it must be a valid
+// absolute http/https URL with a host and no path/query/fragment, so it can be
+// used verbatim as the external origin. It returns a descriptive error on any
+// malformed value so the process fails fast instead of emitting a garbage base
+// URL at request time.
+func (c *Config) ValidateExternalBaseURL() error {
+	if c.ExternalBaseURL == "" {
+		return nil
+	}
+	u, err := url.Parse(c.ExternalBaseURL)
+	if err != nil {
+		return fmt.Errorf("malformed EXTERNAL_BASE_URL %q: %w", c.ExternalBaseURL, err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("EXTERNAL_BASE_URL %q must be an absolute URL with a host", c.ExternalBaseURL)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("EXTERNAL_BASE_URL %q must use the http or https scheme", c.ExternalBaseURL)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("EXTERNAL_BASE_URL %q must not contain a path, query, or fragment", c.ExternalBaseURL)
+	}
+	if u.User != nil {
+		return fmt.Errorf("EXTERNAL_BASE_URL %q must not contain embedded credentials", c.ExternalBaseURL)
+	}
+	return nil
+}
+
+// NormalizedExternalBaseURL returns the configured external base URL as the
+// parsed, normalized origin "<scheme>://<host>" (scheme lowercased by url.Parse,
+// host case preserved), or "" when unset. Returning the parsed form (rather than
+// a TrimRight on the raw input) guarantees the stored value's scheme is
+// lowercased, so handlerutils.RequestIsHTTPS's "https://" prefix check is
+// reliable and cannot disagree with GetBaseURL for a mixed-case scheme (HIGH-1).
+// Callers that have validated the value (see ValidateExternalBaseURL) can use
+// this as the authoritative origin. If the value is unparseable (it should have
+// been rejected by ValidateExternalBaseURL at startup) it falls back to a
+// trailing-slash trim so this accessor never panics.
+func (c *Config) NormalizedExternalBaseURL() string {
+	if c.ExternalBaseURL == "" {
+		return ""
+	}
+	u, err := url.Parse(c.ExternalBaseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return strings.TrimRight(c.ExternalBaseURL, "/")
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // HealthMetricsConfig is the resolved health/metrics policy derived from the

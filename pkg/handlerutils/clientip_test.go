@@ -5,53 +5,56 @@ import (
 	"testing"
 )
 
-// TestGetClientIPTrustDefault verifies that with NO context value set (absent),
-// GetClientIP preserves today's trusting behavior: it honors X-Forwarded-For
-// and X-Real-IP.
+// TestGetClientIPTrustDefault verifies the SECURE default: with NO hop count in
+// context (absent => N=0), GetClientIP ignores X-Forwarded-For / X-Real-IP for
+// the rate-limit key and uses RemoteAddr, so a single spoofed XFF cannot rotate
+// the key. The trust flag alone is not enough; operators must opt in with
+// XFF_TRUSTED_HOP_COUNT. See clientip_hopcount_test.go for the N>0 behavior.
 func TestGetClientIPTrustDefault(t *testing.T) {
-	t.Run("AbsentContextHonorsXFF", func(t *testing.T) {
+	t.Run("AbsentHopCountIgnoresXFF", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://internal.example/path", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Forwarded-For", "203.0.113.7, 70.41.3.18")
 
-		if got := GetClientIP(req); got != "203.0.113.7" {
-			t.Fatalf("expected first XFF IP honored (absent => trust), got %q", got)
+		if got := GetClientIP(req); got != "10.0.0.1" {
+			t.Fatalf("expected RemoteAddr host (absent hop count => N=0), got %q", got)
 		}
 	})
 
-	t.Run("AbsentContextHonorsXRealIP", func(t *testing.T) {
+	t.Run("AbsentHopCountIgnoresXRealIP", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://internal.example/path", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Real-IP", "203.0.113.9")
 
-		if got := GetClientIP(req); got != "203.0.113.9" {
-			t.Fatalf("expected X-Real-IP honored (absent => trust), got %q", got)
+		if got := GetClientIP(req); got != "10.0.0.1" {
+			t.Fatalf("expected RemoteAddr host (absent hop count => N=0), got %q", got)
 		}
 	})
 }
 
-// TestGetClientIPTrustTrue verifies that with trust=true in context,
-// GetClientIP honors the forwarded headers exactly as the legacy code did.
+// TestGetClientIPTrustTrue verifies that trust=true alone (with the default
+// hop count of 0) is NOT sufficient to honor the forwarded headers for the key:
+// they remain ignored until an operator sets a positive hop count.
 func TestGetClientIPTrustTrue(t *testing.T) {
-	t.Run("HonorsXFF", func(t *testing.T) {
+	t.Run("TrustWithoutHopCountIgnoresXFF", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://internal.example/path", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Forwarded-For", "203.0.113.7, 70.41.3.18")
 		req = req.WithContext(WithTrustForwarded(req.Context(), true))
 
-		if got := GetClientIP(req); got != "203.0.113.7" {
-			t.Fatalf("expected first XFF IP honored, got %q", got)
+		if got := GetClientIP(req); got != "10.0.0.1" {
+			t.Fatalf("expected RemoteAddr host (trust=true, N=0), got %q", got)
 		}
 	})
 
-	t.Run("HonorsXRealIP", func(t *testing.T) {
+	t.Run("TrustWithoutHopCountIgnoresXRealIP", func(t *testing.T) {
 		req := httptest.NewRequest("GET", "http://internal.example/path", nil)
 		req.RemoteAddr = "10.0.0.1:5555"
 		req.Header.Set("X-Real-IP", "203.0.113.9")
 		req = req.WithContext(WithTrustForwarded(req.Context(), true))
 
-		if got := GetClientIP(req); got != "203.0.113.9" {
-			t.Fatalf("expected X-Real-IP honored, got %q", got)
+		if got := GetClientIP(req); got != "10.0.0.1" {
+			t.Fatalf("expected RemoteAddr host (trust=true, N=0), got %q", got)
 		}
 	})
 }
@@ -93,14 +96,15 @@ func TestGetClientIPTrustFalse(t *testing.T) {
 	})
 
 	t.Run("IPv6RemoteAddr", func(t *testing.T) {
-		// Document the invariant: the host-extraction strips at the LAST colon, so
-		// a bracketed IPv6 host:port "[::1]:5555" yields "[::1]".
+		// MEDIUM-3: a bracketed IPv6 host:port "[::1]:5555" is parsed safely into
+		// the bare canonical address "::1" (net.SplitHostPort + netip.ParseAddr),
+		// not the mangled "[::1]" a naive last-colon strip would produce.
 		req := httptest.NewRequest("GET", "http://internal.example/path", nil)
 		req.RemoteAddr = "[::1]:5555"
 		req = req.WithContext(WithTrustForwarded(req.Context(), false))
 
-		if got := GetClientIP(req); got != "[::1]" {
-			t.Fatalf("expected IPv6 host extracted as %q, got %q", "[::1]", got)
+		if got := GetClientIP(req); got != "::1" {
+			t.Fatalf("expected IPv6 host extracted as %q, got %q", "::1", got)
 		}
 	})
 }

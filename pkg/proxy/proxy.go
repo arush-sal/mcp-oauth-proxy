@@ -51,6 +51,15 @@ type OAuthProxy struct {
 	forwardCfg      forwardConfig
 	sessionCfg      types.SessionConfig
 
+	// Forwarded-header / external-base-URL policy resolved ONCE at startup (H3,
+	// MEDIUM-5), so withCORS injects immutable snapshots into the request context
+	// instead of re-reading the caller-owned Config pointer on every request.
+	// Validation still happens in cmd.validateConfig; these just snapshot the
+	// resolved values to preserve the set-once-before-serving guarantee.
+	trustForwarded  bool
+	externalBaseURL string
+	xffHopCount     int
+
 	// Health & metrics (F6). healthMetricsCfg holds the resolved policy
 	// (defaulted paths + the metrics-location decision). readinessPing is the
 	// dependency check run by the readiness probe; it defaults to the DB ping
@@ -118,6 +127,14 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		} else if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
 			return nil, fmt.Errorf("MCP server URL must not contain a path, query, or fragment")
 		}
+	}
+
+	// Validate EXTERNAL_BASE_URL before it is snapshotted into the immutable
+	// externalBaseURL field below. cmd.validateConfig also checks this, but a
+	// direct/embedding caller of NewOAuthProxy bypasses the CLI, so validating
+	// here ensures the proxy can never serve a garbage authoritative base URL.
+	if err := config.ValidateExternalBaseURL(); err != nil {
+		return nil, err
 	}
 
 	// Initialize database
@@ -242,6 +259,9 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		metrics:          metrics,
 		ctx:              ctx,
 		cancel:           cancel,
+		trustForwarded:   config.TrustForwardedHeadersEnabled(),
+		externalBaseURL:  config.NormalizedExternalBaseURL(),
+		xffHopCount:      config.XFFTrustedHopCount,
 	}
 	// Default the readiness check to a real DB ping; tests may override it.
 	p.readinessPing = p.db.Ping
@@ -653,7 +673,15 @@ func (p *OAuthProxy) GetHandler() http.Handler {
 // any) is harmless.
 func (p *OAuthProxy) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		r = r.WithContext(handlerutils.WithTrustForwarded(r.Context(), p.config.TrustForwardedHeadersEnabled()))
+		ctx := handlerutils.WithTrustForwarded(r.Context(), p.trustForwarded)
+		// H3: inject the authoritative external base URL (when configured) and the
+		// trusted XFF hop count alongside the trust flag, so GetBaseURL /
+		// RequestIsHTTPS / GetClientIP can read them from the request context.
+		// These are immutable snapshots resolved once in NewOAuthProxy (MEDIUM-5),
+		// not re-read from the caller-owned Config pointer per request.
+		ctx = handlerutils.WithExternalBaseURL(ctx, p.externalBaseURL)
+		ctx = handlerutils.WithXFFTrustedHopCount(ctx, p.xffHopCount)
+		r = r.WithContext(ctx)
 
 		// Set CORS headers
 		w.Header().Set("Access-Control-Allow-Origin", "*")
