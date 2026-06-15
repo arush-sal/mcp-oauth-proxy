@@ -108,7 +108,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch grantType {
 	case "authorization_code":
-		p.handleAuthorizationCodeGrant(w, r, clientID)
+		p.handleAuthorizationCodeGrant(w, r, clientID, clientInfo)
 	case "refresh_token":
 		p.handleRefreshTokenGrant(w, r, clientID)
 	default:
@@ -119,7 +119,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, clientID string) {
+func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, clientID string, clientInfo *types.ClientInfo) {
 	code := r.FormValue("code")
 	codeVerifier := r.FormValue("code_verifier")
 	redirectURI := r.FormValue("redirect_uri")
@@ -153,18 +153,13 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// clientInfo is resolved once in ServeHTTP and threaded in here, so we avoid a
+	// duplicate DB round-trip and the TOCTOU window of re-fetching the same
+	// client. It is needed for redirect-URI validation AND the public-client PKCE
+	// enforcement below.
+
 	// Validate redirect_uri if provided
 	if redirectURI != "" {
-		// Get client info to validate redirect URI
-		clientInfo, err := p.db.GetClient(clientID)
-		if err != nil || clientInfo == nil {
-			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
-				Error:            "invalid_client",
-				ErrorDescription: "Client not found",
-			})
-			return
-		}
-
 		// Check if redirect URI is registered for this client
 		if !slices.Contains(clientInfo.RedirectUris, redirectURI) {
 			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
@@ -175,7 +170,37 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		}
 	}
 
-	// Check if PKCE is being used
+	// H1 (Fix 2): a public client (no usable secret) must always carry a PKCE
+	// challenge. The authorize endpoint guarantees this, but enforce it here too
+	// so an empty-challenge grant cannot bypass PKCE just because
+	// grant.CodeChallenge == "". Without this, a stolen code for a public client
+	// would be directly redeemable.
+	isPublicClient := clientInfo.TokenEndpointAuthMethod == "none" || clientInfo.ClientSecret == ""
+	if isPublicClient && grant.CodeChallenge == "" {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "PKCE code_challenge is required for public clients",
+		})
+		return
+	}
+
+	// H1 (Blocker 2): "S256 mandatory for public clients" must also hold at
+	// REDEMPTION, not just at authorize time. The PKCE verify path below falls
+	// back to a plain (constant-time-free) comparison for any method != "S256",
+	// so a pre-existing or injected grant with method "plain" would otherwise be
+	// redeemable by a public client. Reject any non-S256 method here. Confidential
+	// clients keep their current behavior (plain / no PKCE still allowed).
+	if isPublicClient && grant.CodeChallengeMethod != "S256" {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "PKCE S256 is required for public clients",
+		})
+		return
+	}
+
+	// Check if PKCE is being used. PKCE is enforced whenever the grant carries a
+	// challenge; for public clients a challenge is mandatory (checked above), so
+	// PKCE can never be silently skipped.
 	isPkceEnabled := grant.CodeChallenge != ""
 	if isPkceEnabled && codeVerifier == "" {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{

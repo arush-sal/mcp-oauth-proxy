@@ -38,6 +38,13 @@ func NewHandler(db AuthorizationStore, provider providers.Provider, scopesSuppor
 	}
 }
 
+// isPublicClient reports whether a client lacks a usable secret and is therefore
+// a "public" client for PKCE purposes: it either declared
+// token_endpoint_auth_method == "none" or has no stored client secret.
+func isPublicClient(c *types.ClientInfo) bool {
+	return c.TokenEndpointAuthMethod == "none" || c.ClientSecret == ""
+}
+
 func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Get parameters from query or form
 	var params url.Values
@@ -103,6 +110,29 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ErrorDescription: "Invalid redirect URI",
 		})
 		return
+	}
+
+	// H1 (Fix 2): public clients (no usable secret) must use PKCE with S256.
+	// Without a client secret, a stolen authorization code is otherwise directly
+	// redeemable, so requiring a code_challenge bound to the request is the only
+	// protection against auth-code interception. We reject a missing challenge
+	// and the downgradeable "plain" method here, before any state is stored.
+	// Confidential clients (with a secret) keep their prior behavior.
+	if isPublicClient(clientInfo) {
+		if authReq.CodeChallenge == "" {
+			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+				Error:            "invalid_request",
+				ErrorDescription: "code_challenge is required for public clients (PKCE S256)",
+			})
+			return
+		}
+		if authReq.CodeChallengeMethod != "S256" {
+			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+				Error:            "invalid_request",
+				ErrorDescription: "code_challenge_method must be S256 for public clients",
+			})
+			return
+		}
 	}
 
 	// Check if provider is configured

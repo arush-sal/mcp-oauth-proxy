@@ -6,12 +6,75 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 )
+
+// validateRedirectURI enforces the H1 DCR redirect URI allowlist. A URI is
+// accepted only when it is https (any host) or loopback http
+// (127.0.0.1 / localhost / [::1], optional port/path). For every URI a URL
+// fragment, embedded credentials (user:pass@) and a wildcard ("*") are
+// rejected. Non-loopback http is rejected. The returned error is suitable as
+// the description of an RFC 7591 invalid_redirect_uri response.
+func validateRedirectURI(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("redirect URI must not be empty")
+	}
+	// Wildcards are never allowed (open-redirect / pattern matching abuse).
+	if strings.Contains(raw, "*") {
+		return fmt.Errorf("redirect URI %q must not contain a wildcard", raw)
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("redirect URI %q is not a valid URL", raw)
+	}
+
+	// Fragments are not permitted on redirect URIs (RFC 6749 §3.1.2).
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		return fmt.Errorf("redirect URI %q must not contain a fragment", raw)
+	}
+
+	// Embedded credentials (user:pass@host) are forbidden.
+	if u.User != nil {
+		return fmt.Errorf("redirect URI %q must not contain embedded credentials", raw)
+	}
+
+	// A redirect URI must always carry a host; a hostless URI such as
+	// "https:///path" (url.Parse yields scheme=https, host="") is never a valid
+	// redirect target.
+	if u.Hostname() == "" {
+		return fmt.Errorf("redirect URI %q must have a host", raw)
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf("redirect URI %q uses http with a non-loopback host; only https or loopback http is allowed", raw)
+	default:
+		return fmt.Errorf("redirect URI %q must use https or loopback http", raw)
+	}
+}
+
+// isLoopbackHost reports whether host is a permitted loopback target for an
+// http redirect URI: localhost, 127.0.0.1, or ::1.
+func isLoopbackHost(host string) bool {
+	switch strings.ToLower(host) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
+}
 
 type ClientStore interface {
 	StoreClient(client *types.ClientInfo) error
@@ -81,6 +144,21 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ErrorDescription: err.Error(),
 		})
 		return
+	}
+
+	// H1 (Fix 1): restrict the redirect URIs accepted at DCR time so a
+	// self-registered client cannot use an attacker-controlled redirect target
+	// for consent-phishing / auth-code interception. Only https (any host) and
+	// loopback http are permitted; fragments, embedded credentials and wildcards
+	// are always rejected. Returns invalid_redirect_uri (RFC 7591) with 400.
+	for _, uri := range clientInfo.RedirectUris {
+		if err := validateRedirectURI(uri); err != nil {
+			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+				Error:            "invalid_redirect_uri",
+				ErrorDescription: err.Error(),
+			})
+			return
+		}
 	}
 
 	// Generate client ID and secret

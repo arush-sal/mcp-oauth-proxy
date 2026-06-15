@@ -1,6 +1,8 @@
 package token
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// pkceS256 returns the base64url(SHA-256(verifier)) PKCE challenge for a verifier.
+func pkceS256(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
 
 // defaultSession returns the default resolved session config (defaults
 // reproduce the historical 1h access / 720h refresh behavior).
@@ -138,7 +146,7 @@ func newAuthCodeRequest(code, clientID string) *http.Request {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("client_id", clientID)
-	form.Set("code_verifier", "challenge")
+	form.Set("code_verifier", "the-verifier")
 	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	return req
@@ -146,7 +154,9 @@ func newAuthCodeRequest(code, clientID string) *http.Request {
 
 // authCodeStore returns a fakeStore whose grant is usable for the
 // authorization_code grant (ValidateAuthCode returns its grantID/userID and the
-// grant's ClientID matches "client").
+// grant's ClientID matches "client"). The default client is public ("none") and
+// the grant uses S256 PKCE (mandatory for public clients, Blocker 2) whose
+// challenge matches the "the-verifier" verifier sent by newAuthCodeRequest.
 func authCodeStore(t *testing.T) *fakeStore {
 	t.Helper()
 	s := &fakeStore{
@@ -155,12 +165,169 @@ func authCodeStore(t *testing.T) *fakeStore {
 			ID:       "grant-1",
 			UserID:   "user-1",
 			ClientID: "client",
-			// PKCE is enabled so redirect_uri is not required (OAuth 2.1).
-			CodeChallenge:       "challenge",
-			CodeChallengeMethod: "plain",
+			// PKCE is enabled so redirect_uri is not required (OAuth 2.1). S256 is
+			// mandatory for public clients at redemption (Blocker 2).
+			CodeChallenge:       pkceS256("the-verifier"),
+			CodeChallengeMethod: "S256",
 		},
 	}
 	return s
+}
+
+// TestAuthorizationCodeGrant_PublicClientRejectsEmptyChallenge is the H1 Fix 2
+// token-side guard: for a public client (auth method "none"), a grant carrying
+// an empty CodeChallenge must NOT be redeemable. Before the fix, isPkceEnabled
+// was simply grant.CodeChallenge != "", so an empty-challenge public grant
+// bypassed PKCE entirely. The code must not be consumed and no token issued.
+func TestAuthorizationCodeGrant_PublicClientRejectsEmptyChallenge(t *testing.T) {
+	store := authCodeStore(t)
+	store.grant.CodeChallenge = ""
+	// Keep the method S256 so this test isolates the EMPTY-challenge guard: if it
+	// were also empty, the non-S256 guard would reject the request too, masking a
+	// regression of the empty-challenge branch.
+	store.grant.CodeChallengeMethod = "S256"
+	// Register a redirect URI and send it so the request cannot be rejected by
+	// the OAuth 2.1 "redirect_uri required when not using PKCE" branch. The only
+	// remaining reason to reject is the public-client PKCE enforcement.
+	store.client.RedirectUris = []string{"https://app.example/cb"}
+
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", "the-code")
+	form.Set("client_id", "client")
+	form.Set("redirect_uri", "https://app.example/cb")
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Empty(t, store.stored, "public client without a code challenge must not receive tokens")
+	assert.False(t, store.codeConsumed, "rejected public-client exchange must not consume the code")
+}
+
+// TestAuthorizationCodeGrant_PublicClientS256Succeeds proves the happy path is
+// untouched: a public-client grant with a valid S256 challenge and matching
+// verifier completes the exchange.
+func TestAuthorizationCodeGrant_PublicClientS256Succeeds(t *testing.T) {
+	store := authCodeStore(t)
+	// S256(challenge for "the-verifier") computed by the handler must match.
+	store.grant.CodeChallenge = pkceS256("the-verifier")
+	store.grant.CodeChallengeMethod = "S256"
+
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", "the-code")
+	form.Set("client_id", "client")
+	form.Set("code_verifier", "the-verifier")
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	assert.Len(t, store.stored, 1)
+	assert.True(t, store.codeConsumed)
+}
+
+// TestAuthorizationCodeGrant_PublicClientRejectsPlainPKCE is the H1 Blocker 2
+// guard: for a public client (auth method "none"), a grant whose PKCE method is
+// "plain" (or anything other than S256) must NOT be redeemable at /token, even
+// though it carries a non-empty CodeChallenge. "S256 mandatory for public
+// clients" must hold at redemption to defend pre-existing / injected grants.
+func TestAuthorizationCodeGrant_PublicClientRejectsPlainPKCE(t *testing.T) {
+	store := authCodeStore(t)
+	// Downgrade the grant to plain PKCE: a public client must NOT be able to
+	// redeem a plain-method grant (Blocker 2).
+	store.grant.CodeChallenge = "challenge"
+	store.grant.CodeChallengeMethod = "plain"
+	store.client.RedirectUris = []string{"https://app.example/cb"}
+
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", "the-code")
+	form.Set("client_id", "client")
+	form.Set("redirect_uri", "https://app.example/cb")
+	form.Set("code_verifier", "challenge")
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "invalid_grant")
+	assert.Empty(t, store.stored, "public client with plain PKCE must not receive tokens")
+	assert.False(t, store.codeConsumed, "rejected public-client plain-PKCE exchange must not consume the code")
+}
+
+// TestAuthorizationCodeGrant_ConfidentialClientPlainPKCESucceeds is the
+// regression guard for Blocker 2: confidential clients keep current behavior, so
+// a confidential client with a "plain" PKCE challenge (and matching verifier)
+// still completes the exchange.
+func TestAuthorizationCodeGrant_ConfidentialClientPlainPKCESucceeds(t *testing.T) {
+	store := authCodeStore(t)
+	// Make the client confidential (has a secret, not "none").
+	store.client.TokenEndpointAuthMethod = "client_secret_post"
+	store.client.ClientSecret = "the-secret"
+	// Grant uses plain PKCE: verifier must equal the challenge.
+	store.grant.CodeChallenge = "challenge"
+	store.grant.CodeChallengeMethod = "plain"
+
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", "the-code")
+	form.Set("client_id", "client")
+	form.Set("client_secret", "the-secret")
+	form.Set("code_verifier", "challenge")
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	assert.Len(t, store.stored, 1, "confidential client with plain PKCE must still succeed")
+	assert.True(t, store.codeConsumed)
+}
+
+// TestAuthorizationCodeGrant_ConfidentialClientNoPKCESucceeds is the regression
+// guard proving confidential clients with no PKCE at all are still allowed.
+func TestAuthorizationCodeGrant_ConfidentialClientNoPKCESucceeds(t *testing.T) {
+	store := authCodeStore(t)
+	store.client.TokenEndpointAuthMethod = "client_secret_post"
+	store.client.ClientSecret = "the-secret"
+	store.grant.CodeChallenge = ""
+	store.grant.CodeChallengeMethod = ""
+	store.client.RedirectUris = []string{"https://app.example/cb"}
+
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", "the-code")
+	form.Set("client_id", "client")
+	form.Set("client_secret", "the-secret")
+	form.Set("redirect_uri", "https://app.example/cb")
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	assert.Len(t, store.stored, 1, "confidential client without PKCE must still succeed")
+	assert.True(t, store.codeConsumed)
 }
 
 func TestAuthorizationCodeGrant_RejectsMissingPKCEVerifier(t *testing.T) {

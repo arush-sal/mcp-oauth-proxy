@@ -1,6 +1,7 @@
 package register
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -62,6 +63,67 @@ func TestRegisterDisabledForbidden(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, w.Code, "body: %s", w.Body.String())
 	assert.Contains(t, w.Body.String(), "dynamic client registration is disabled")
 	assert.Empty(t, store.clients, "no client should be stored when DCR is disabled")
+}
+
+// TestRegisterRedirectURIValidation enforces the H1 DCR redirect_uri allowlist:
+// only https:// (any host) and loopback http (127.0.0.1 / localhost / [::1]) are
+// accepted. Fragments, embedded credentials, and wildcards are always rejected,
+// and non-loopback http:// is rejected. A rejection must return 400 with an
+// invalid_redirect_uri error (RFC 7591) and must not store the client.
+func TestRegisterRedirectURIValidation(t *testing.T) {
+	cases := []struct {
+		name     string
+		uri      string
+		accepted bool
+	}{
+		{"https any host accepted", "https://app.example/cb", true},
+		{"loopback ipv4 with port accepted", "http://127.0.0.1:1234/cb", true},
+		{"loopback localhost accepted", "http://localhost/cb", true},
+		{"loopback ipv6 accepted", "http://[::1]/cb", true},
+		{"non-loopback http rejected", "http://evil.com/cb", false},
+		{"fragment rejected", "https://app/cb#frag", false},
+		{"embedded credentials rejected", "https://user:pass@app/cb", false},
+		{"wildcard rejected", "https://*.evil/cb", false},
+		// Loopback-as-subdomain must not be treated as loopback.
+		{"loopback as subdomain rejected", "http://127.0.0.1.evil.com", false},
+		// Obfuscated loopback forms (hex octet, decimal integer) are not the
+		// allowlisted literal "127.0.0.1" and must be rejected.
+		{"hex obfuscated loopback rejected", "http://0x7f.0.0.1", false},
+		{"decimal integer loopback rejected", "http://2130706433", false},
+		// Scheme-relative URI has an empty scheme; must be rejected.
+		{"scheme-relative rejected", "//evil.com/path", false},
+		// Hostless https (Blocker 1) must be rejected.
+		{"hostless https rejected", "https:///path", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newFakeStore()
+			h := NewHandler(store, true)
+
+			// Build the body with json.Marshal so backslash-containing or
+			// otherwise special URIs are not accidentally malformed by string
+			// concatenation.
+			bodyBytes, err := json.Marshal(map[string]any{
+				"redirect_uris":              []string{tc.uri},
+				"client_name":                "Test",
+				"token_endpoint_auth_method": "none",
+			})
+			require.NoError(t, err)
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/register", strings.NewReader(string(bodyBytes)))
+			h.ServeHTTP(w, req)
+
+			if tc.accepted {
+				require.Equal(t, http.StatusOK, w.Code, "uri %q should be accepted, body: %s", tc.uri, w.Body.String())
+				assert.Len(t, store.clients, 1)
+				return
+			}
+			require.Equal(t, http.StatusBadRequest, w.Code, "uri %q should be rejected", tc.uri)
+			assert.Contains(t, w.Body.String(), "invalid_redirect_uri")
+			assert.Empty(t, store.clients, "rejected redirect URI must not store a client")
+		})
+	}
 }
 
 // TestExistingClientStillResolvesWhenDisabled proves that a pre-existing /
