@@ -5,10 +5,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 )
+
+// unknownClientIP is the sentinel rate-limit key used when no valid client IP
+// can be derived (neither the selected X-Forwarded-For entry nor the RemoteAddr
+// fallback parses as an IP). Collapsing all malformed/garbage input onto this
+// single shared key prevents a client from minting distinct spoofed keys from
+// unvalidated input. It is intentionally not a valid IP so it can never collide
+// with a real per-IP key.
+const unknownClientIP = "unknown"
 
 // trustForwardedKey is the context key under which the resolved
 // "trust forwarded headers" policy is stored. Using an unexported struct type
@@ -33,6 +43,57 @@ func trustForwardedFromContext(ctx context.Context) bool {
 		return true
 	}
 	return trust
+}
+
+// externalBaseURLKey is the context key under which the resolved, authoritative
+// external base URL (H3, part A) is stored. When present and non-empty it is the
+// highest-precedence source for GetBaseURL / RequestIsHTTPS, overriding all
+// client-supplied forwarded headers regardless of the trust policy.
+type externalBaseURLKeyType struct{}
+
+var externalBaseURLKey = externalBaseURLKeyType{}
+
+// WithExternalBaseURL returns a copy of ctx carrying the authoritative external
+// base URL. An empty string is treated as "unset" (no override). Callers must
+// pass a normalized, validated value (see types.Config.ValidateExternalBaseURL /
+// NormalizedExternalBaseURL).
+func WithExternalBaseURL(ctx context.Context, baseURL string) context.Context {
+	return context.WithValue(ctx, externalBaseURLKey, baseURL)
+}
+
+// externalBaseURLFromContext returns the authoritative external base URL and
+// whether one is set (non-empty). When ABSENT or empty it returns ("", false)
+// so behavior falls back to the trust-gated forwarded-header logic.
+func externalBaseURLFromContext(ctx context.Context) (string, bool) {
+	v, ok := ctx.Value(externalBaseURLKey).(string)
+	if !ok || v == "" {
+		return "", false
+	}
+	return v, true
+}
+
+// xffTrustedHopCountKey is the context key under which the configured number of
+// trusted proxy hops (H3, part B) is stored. It governs which X-Forwarded-For
+// entry GetClientIP uses for the per-IP rate-limit key.
+type xffTrustedHopCountKeyType struct{}
+
+var xffTrustedHopCountKey = xffTrustedHopCountKeyType{}
+
+// WithXFFTrustedHopCount returns a copy of ctx carrying the number of trusted
+// proxy hops in front of this server.
+func WithXFFTrustedHopCount(ctx context.Context, n int) context.Context {
+	return context.WithValue(ctx, xffTrustedHopCountKey, n)
+}
+
+// xffTrustedHopCountFromContext returns the configured trusted-hop count. When
+// ABSENT it returns 0 (the secure default: do not trust any XFF entry for the
+// rate-limit key).
+func xffTrustedHopCountFromContext(ctx context.Context) int {
+	n, ok := ctx.Value(xffTrustedHopCountKey).(int)
+	if !ok {
+		return 0
+	}
+	return n
 }
 
 // trustedProxyURL returns the parsed, trusted X-Mcp-Oauth-Proxy-URL header when
@@ -98,6 +159,12 @@ func requestIsHTTPS(r *http.Request, trust bool) bool {
 // flag and the derived base-URL scheme cannot disagree. See requestIsHTTPS for
 // the precedence rule.
 func RequestIsHTTPS(r *http.Request) bool {
+	// An authoritative external base URL (H3) is the highest precedence: its
+	// scheme decides https-ness so the cookie Secure flag matches GetBaseURL,
+	// regardless of the trust policy or forwarded headers.
+	if base, ok := externalBaseURLFromContext(r.Context()); ok {
+		return strings.HasPrefix(base, "https://")
+	}
 	return requestIsHTTPS(r, trustForwardedFromContext(r.Context()))
 }
 
@@ -118,36 +185,86 @@ func JSON(w http.ResponseWriter, statusCode int, obj any) {
 	}
 }
 
-// GetClientIP extracts the client IP from the request. It is the per-IP
-// rate-limit key for /authorize, /token, /register, so it MUST honor the
-// trust-forwarded policy injected by withCORS (see WithTrustForwarded).
+// GetClientIP extracts the client IP used as the per-IP rate-limit key for
+// /authorize, /token, /register. It MUST be robust against a client spoofing
+// X-Forwarded-For to rotate the key, so it honors both the trust-forwarded
+// policy (see WithTrustForwarded) and the configured number of trusted proxy
+// hops (see WithXFFTrustedHopCount).
 //
-// When forwarded headers are trusted (the default and the absent-context
-// case), it honors X-Forwarded-For (first entry) then X-Real-IP, preserving the
-// historical behavior. When trust is disabled, both client-supplied headers are
-// ignored and the IP is derived from r.RemoteAddr (host:port -> host); this
-// stops a client from spoofing X-Forwarded-For to rotate the rate-limit key.
+// Precedence:
+//
+//  1. trust disabled => ignore all forwarded headers; use RemoteAddr (host).
+//  2. trust enabled, N = trusted hops > 0 => the X-Forwarded-For chain is
+//     appended left-to-right, so the RIGHTMOST entries are added by the closest
+//     trusted proxies. The real client IP is parts[len(parts)-N]; spoofed
+//     client-supplied entries sit to the LEFT and are ignored. If N exceeds the
+//     number of XFF entries (or there are none), fall back to RemoteAddr (fail
+//     safe).
+//  3. trust enabled, N == 0 (default) => do NOT trust any XFF entry; use
+//     RemoteAddr, so a single spoofed XFF cannot rotate the key.
+//
+// X-Real-IP is intentionally NOT used for the key: it is a single
+// client-spoofable value with no hop accounting, so trusting it would reopen the
+// rotation vector. Operators behind a trusted LB should set N to their hop count
+// (1 for a single ALB) to get a correct, non-spoofable per-client key.
 func GetClientIP(r *http.Request) string {
 	if trustForwardedFromContext(r.Context()) {
-		// Check X-Forwarded-For header first
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Get the first IP in the comma-separated list
-			ifs := strings.Split(xff, ",")
-			return strings.TrimSpace(ifs[0])
-		}
-
-		// Check X-Real-IP header
-		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			return xri
+		if n := xffTrustedHopCountFromContext(r.Context()); n > 0 {
+			// Materialize ALL X-Forwarded-For field lines in order before
+			// splitting (HIGH-2): a client can send its own line and a trusted LB
+			// can APPEND a separate line, and Header.Get would see only the first
+			// (client) line. Joining the values preserves the appended order so
+			// the rightmost entry is the closest trusted proxy's contribution.
+			if lines := r.Header.Values("X-Forwarded-For"); len(lines) > 0 {
+				parts := strings.Split(strings.Join(lines, ","), ",")
+				if n <= len(parts) {
+					// Parse the selected entry safely (MEDIUM-3). Empty/garbage
+					// entries fall through to the RemoteAddr fallback so the key is
+					// always a valid IP.
+					if ip, ok := parseIPCandidate(parts[len(parts)-n]); ok {
+						return ip
+					}
+				}
+				// N exceeds the number of entries, or the selected entry is not a
+				// valid IP: fail safe to RemoteAddr.
+			}
 		}
 	}
 
-	// Fall back to RemoteAddr (also the only source when trust is disabled).
-	ip := r.RemoteAddr
-	if colonIndex := strings.LastIndex(ip, ":"); colonIndex != -1 {
-		ip = ip[:colonIndex]
+	// Fall back to RemoteAddr (the secure default and the only source when trust
+	// is disabled or no trusted-hop count is configured). Parse it the same safe
+	// way so an IPv6 RemoteAddr ("[::1]:5555" / bare "::1") is not mangled.
+	if ip, ok := parseIPCandidate(r.RemoteAddr); ok {
+		return ip
 	}
-	return ip
+	// No valid IP could be derived from any source. Return the fixed sentinel
+	// rather than the raw, unvalidated RemoteAddr so malformed/garbage input
+	// collapses to one shared key and cannot be used to mint distinct spoofed
+	// keys.
+	return unknownClientIP
+}
+
+// parseIPCandidate normalizes a single client-IP candidate (an X-Forwarded-For
+// entry or RemoteAddr) into a valid IP string for use as the rate-limit key. It
+// trims surrounding space, strips an optional ":port" (or "[ipv6]:port") with
+// net.SplitHostPort, falls back to the raw value when there is no port, and
+// validates the result with netip.ParseAddr. It returns ("", false) when the
+// candidate is empty or not a parseable IP, so callers can fail safe. Unlike a
+// naive LastIndex(":") port strip, this handles IPv6 (bracketed host:port and
+// bare addresses) correctly.
+func parseIPCandidate(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", false
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil {
+		s = host
+	}
+	addr, err := netip.ParseAddr(s)
+	if err != nil {
+		return "", false
+	}
+	return addr.String(), true
 }
 
 // GetBaseURL returns the URL of the request without the path and
@@ -172,6 +289,13 @@ func GetClientIP(r *http.Request) string {
 // fallback path shares requestIsHTTPS directly. So the cookie Secure flag and
 // this base URL cannot disagree for any combination of inputs.
 func GetBaseURL(r *http.Request) string {
+	// An authoritative external base URL (H3) overrides everything: return it
+	// verbatim and ignore X-Mcp-Oauth-Proxy-URL / X-Forwarded-Proto / r.Host,
+	// regardless of the trust policy.
+	if base, ok := externalBaseURLFromContext(r.Context()); ok {
+		return base
+	}
+
 	trust := trustForwardedFromContext(r.Context())
 
 	if u, ok := trustedProxyURL(r, trust); ok {

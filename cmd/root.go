@@ -93,7 +93,18 @@ type RootCmd struct {
 	// Host header. Set false when the proxy is NOT behind a trusted reverse
 	// proxy. Note: the Host header itself should be constrained by a fronting
 	// reverse proxy / allowed-host config at the infrastructure layer.
-	TrustForwardedHeaders bool `name:"trust-forwarded-headers" env:"TRUST_FORWARDED_HEADERS" usage:"Trust client-supplied forwarded headers. When true, they govern: the external base URL (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto), the per-IP rate-limit client IP (X-Forwarded-For, X-Real-IP), and the auto cookie-Secure decision (X-Forwarded-Proto, X-Mcp-Oauth-Proxy-URL scheme). When false, all of those forwarded headers are ignored: the base URL and Secure flag come from the connection (TLS) and the request Host, and the rate-limit IP comes from RemoteAddr; constrain the Host header at the infrastructure layer (fronting reverse proxy / allowed-host config)" default:"true"`
+	TrustForwardedHeaders bool `name:"trust-forwarded-headers" env:"TRUST_FORWARDED_HEADERS" usage:"Trust client-supplied forwarded headers. When true, they govern: the external base URL (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto), the per-IP rate-limit client IP (X-Forwarded-For, gated by --xff-trusted-hop-count), and the auto cookie-Secure decision (X-Forwarded-Proto, X-Mcp-Oauth-Proxy-URL scheme). When false, all of those forwarded headers are ignored: the base URL and Secure flag come from the connection (TLS) and the request Host, and the rate-limit IP comes from RemoteAddr; constrain the Host header at the infrastructure layer (fronting reverse proxy / allowed-host config). See also --external-base-url, which takes precedence for the base URL/scheme regardless of this flag" default:"true"`
+
+	// External base URL override (H3, part A). When set, it is the AUTHORITATIVE
+	// external base URL and overrides/ignores X-Mcp-Oauth-Proxy-URL and
+	// X-Forwarded-Proto entirely, regardless of --trust-forwarded-headers.
+	// Recommended behind a load balancer that does not strip arbitrary
+	// client-supplied headers.
+	ExternalBaseURL string `name:"external-base-url" env:"EXTERNAL_BASE_URL" usage:"Authoritative external base URL of the proxy (e.g. https://auth.example.com). When set, it overrides and IGNORES the client-supplied X-Mcp-Oauth-Proxy-URL and X-Forwarded-Proto headers entirely when deriving the external base URL (redirect URIs, OAuth metadata, WWW-Authenticate resource_metadata) and the cookie-Secure scheme, regardless of --trust-forwarded-headers. Must be an absolute http/https URL with a host and no path/query/fragment. Recommended behind a load balancer that does not strip arbitrary client-supplied headers"`
+
+	// XFF trusted hop count (H3, part B). Default 0 means RemoteAddr is used for
+	// the rate-limit key so a single spoofed X-Forwarded-For cannot rotate it.
+	XFFTrustedHopCount int `name:"xff-trusted-hop-count" env:"XFF_TRUSTED_HOP_COUNT" usage:"Number of trusted proxy hops in front of this server, used to pick the per-IP rate-limit client IP from X-Forwarded-For (only when forwarded headers are trusted). The XFF chain is appended left-to-right, so with N hops the real client IP is the entry N positions from the RIGHT; spoofed leftmost entries are ignored. Default 0 trusts no XFF entry and uses RemoteAddr (so a single spoofed XFF cannot rotate the rate-limit key); set to your hop count (1 for a single ALB) for correct per-client keys" default:"0"`
 
 	// Logging
 	Verbose bool `name:"verbose,v" usage:"Enable verbose logging"`
@@ -156,6 +167,9 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		EnableDynamicClientRegistration: &c.EnableDynamicClientRegistration,
 
 		TrustForwardedHeaders: &c.TrustForwardedHeaders,
+
+		ExternalBaseURL:    c.ExternalBaseURL,
+		XFFTrustedHopCount: c.XFFTrustedHopCount,
 	}
 
 	// Validate configuration
@@ -313,6 +327,11 @@ func (c *RootCmd) validateConfig() error {
 	})
 	if err := hmCfg.Validate(c.RoutePrefix); err != nil {
 		return fmt.Errorf("invalid health/metrics configuration: %w", err)
+	}
+	// Reject a malformed EXTERNAL_BASE_URL up front so the process fails with a
+	// clear error instead of emitting a garbage base URL at request time.
+	if err := (&types.Config{ExternalBaseURL: c.ExternalBaseURL}).ValidateExternalBaseURL(); err != nil {
+		return err
 	}
 	return nil
 }
