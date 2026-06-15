@@ -69,6 +69,16 @@ type OAuthProxy struct {
 	// idtoken.MaybeNewVerifier call. Production never sets these.
 	idtokenSleep func(time.Duration)
 	idtokenBuild func() (callback.IDTokenVerifier, error)
+
+	// idtokenVerifyUnavailable records that id_token verification was EXPECTED
+	// (all OIDC params present) but the verifier could NOT be built after
+	// retries, so the verifier is nil despite OIDC being configured (H2). It is
+	// set ONLY in buildIDTokenVerifier's exhausted-retry/degrade branch and is
+	// NOT set for the non-OIDC case (params absent => a nil verifier is
+	// legitimate). When set, readiness reports 503 so the pod is taken out of
+	// rotation rather than serving traffic with the strongest authz controls
+	// (hd/groups/azp/aud/iss signed-claim checks) silently disabled.
+	idtokenVerifyUnavailable bool
 }
 
 const (
@@ -418,6 +428,11 @@ func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
 		log.Printf("WARNING: id_token verification is DISABLED for this process: failed to build the OIDC id_token verifier after retries: %v. "+
 			"Group and hosted-domain authorization rules will not match and email rules lose signature/issuer/audience guarantees. "+
 			"Restart once the JWKS endpoint (%s) is reachable.", err, p.config.OAuthJWKSURL)
+		// Verification was EXPECTED (params present, checked above) but could not
+		// be built. Record this so readiness fails closed (503) and the pod is
+		// taken out of rotation rather than serving with verification disabled.
+		// This is set ONLY here: the non-OIDC early return above never reaches it.
+		p.idtokenVerifyUnavailable = true
 		return nil
 	}
 	if verifier == nil {
@@ -434,6 +449,15 @@ func (p *OAuthProxy) buildIDTokenVerifier() callback.IDTokenVerifier {
 	}
 
 	return verifier
+}
+
+// idTokenVerificationUnavailable reports whether id_token verification was
+// EXPECTED (all OIDC params configured) but the verifier could not be built,
+// leaving the strongest signed-claim authorization controls disabled. Readiness
+// uses this to fail closed (503) so the instance takes no traffic. It is never
+// true for a non-OIDC setup, where a nil verifier is legitimate.
+func (p *OAuthProxy) idTokenVerificationUnavailable() bool {
+	return p.idtokenVerifyUnavailable
 }
 
 // oidcIssuerFromAuthorizeURL derives the expected id_token issuer ("iss") from
