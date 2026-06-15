@@ -259,6 +259,22 @@ self-registration is required. When disabled:
   blocks *new* self-registration; stored clients continue to authenticate and
   authorize normally.
 
+When DCR is enabled, registrations are still hardened against
+consent-phishing / authorization-code interception:
+
+- **Redirect URIs are restricted.** Each `redirect_uris` entry must be either
+  `https://` (any host) or loopback `http://` (`127.0.0.1`, `localhost`, or
+  `[::1]`, with an optional port/path — what CLI clients such as Claude Code and
+  Codex use). Non-loopback `http://`, URL **fragments** (`#…`), **embedded
+  credentials** (`user:pass@…`), and **wildcards** (`*`) are rejected with a
+  `400` and `invalid_redirect_uri` (RFC 7591).
+- **PKCE S256 is mandatory for public clients.** A public client (one registered
+  with `token_endpoint_auth_method: "none"` or without a usable client secret)
+  must send a `code_challenge` with `code_challenge_method=S256` at `/authorize`;
+  a missing challenge or `plain` is rejected. The token endpoint also refuses to
+  redeem a public-client authorization code that lacks a bound PKCE challenge, so
+  PKCE cannot be bypassed. Confidential clients (with a secret) are unaffected.
+
 ## Authorization / Allowlist
 
 > [!WARNING]
