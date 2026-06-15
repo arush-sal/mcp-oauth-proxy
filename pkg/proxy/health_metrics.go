@@ -115,10 +115,26 @@ func (p *OAuthProxy) livenessHandler(w http.ResponseWriter, r *http.Request) {
 	handlerutils.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readinessHandler is the Kubernetes-style readiness probe. It checks the
-// proxy's critical dependency (the database) via a ping with a short timeout
-// and returns 200 when ready or 503 with an error body when not.
+// readinessHandler is the Kubernetes-style readiness probe. It returns 200 when
+// ready or 503 with an error body when not. It fails closed when EITHER:
+//   - id_token verification was EXPECTED (all OIDC params configured) but the
+//     verifier could not be built (H2). Serving with a nil verifier would
+//     silently degrade authorization to userinfo-email-only and disable the
+//     signed-claim checks (hd/groups/azp/aud/iss), so the instance must take no
+//     traffic. Liveness stays 200 so the pod is out of rotation, not crash-looped.
+//   - the proxy's critical dependency (the database) is unreachable.
 func (p *OAuthProxy) readinessHandler(w http.ResponseWriter, r *http.Request) {
+	// Fail closed when id_token verification was expected but is unavailable, so
+	// the instance is removed from the load balancer rather than serving with
+	// the strongest authorization controls silently disabled.
+	if p.idTokenVerificationUnavailable() {
+		handlerutils.JSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unavailable",
+			"reason": "id_token verification unavailable",
+		})
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 

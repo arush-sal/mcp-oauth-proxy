@@ -246,12 +246,14 @@ Token and cookie lifetimes plus cookie security attributes are configurable. Def
 | Variable          | Required | Description                                                                                       |
 | ----------------- | -------- | ------------------------------------------------------------------------------------------------- |
 | `HEALTH_PATH`     | ❌       | Liveness probe path, returns `200` unconditionally (default `/healthz`)                            |
-| `READY_PATH`      | ❌       | Readiness probe path, returns `200` when the database is reachable else `503` (default `/readyz`)  |
+| `READY_PATH`      | ❌       | Readiness probe path, returns `200` when ready else `503` (default `/readyz`). See the fail-closed note below |
 | `ENABLE_METRICS`  | ❌       | Enable the Prometheus metrics endpoint (default `false`)                                           |
 | `METRICS_PATH`    | ❌       | Path for the Prometheus metrics endpoint (default `/metrics`)                                      |
 | `METRICS_ADDRESS` | ❌       | When set (e.g. `:9090`), serve metrics on a separate listener at this address instead of the main mux |
 
 Probes are mounted unauthenticated at the root, so they are unaffected by any route prefix; the legacy `/health` endpoint keeps working. Metrics expose `http_requests_total` and `http_request_duration_seconds` plus standard Go/process collectors.
+
+When OIDC id_token verification is configured (issuer, JWKS URL, and client ID all set) but the verifier cannot be initialized after startup retries, `READY_PATH` reports `503` (fail-closed) with `{"status":"unavailable","reason":"id_token verification unavailable"}` so the instance takes no traffic with verification disabled — running without it would silently degrade authorization to userinfo-email-only and drop the signed-claim checks. Liveness stays `200` (the process is up, just out of rotation). A non-OIDC setup is unaffected: a nil verifier is legitimate and readiness stays healthy.
 
 ## Advanced configuration
 

@@ -205,6 +205,20 @@ always on, metrics are off, and the legacy `/health` route keeps working.
   for the Kubernetes readiness probe so traffic is only routed once the data
   store is reachable.
 
+> [!IMPORTANT]
+> **Readiness fails closed when id_token verification is configured but cannot
+> be initialized.** When OIDC id_token verification is expected (issuer, JWKS
+> URL, and client ID all configured) but the verifier cannot be built after
+> startup retries, `READY_PATH` returns `503`
+> (`{"status":"unavailable","reason":"id_token verification unavailable"}`) so
+> the instance takes **no** traffic rather than silently degrading
+> authorization to userinfo-email-only with the signed-claim checks
+> (`hd`/`groups`/`azp`/`aud`/`iss`) disabled. Liveness (`HEALTH_PATH`) stays
+> `200` so the pod is taken out of rotation, not crash-looped — restart or
+> recovery of the JWKS endpoint clears the condition. A non-OIDC setup (no JWKS
+> URL configured) is unaffected: a nil verifier is legitimate there and
+> readiness stays healthy.
+
 The probe endpoints are registered at the **root** (never under `ROUTE_PREFIX`,
 mirroring the `.well-known/*` metadata) so probe paths stay stable, and they are
 **unauthenticated** and not rate-limited so probes always succeed. They use
