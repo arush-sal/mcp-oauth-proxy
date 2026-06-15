@@ -5,7 +5,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/ratelimit"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -35,6 +37,44 @@ func newDCRTestProxy(t *testing.T, enableDCR *bool) http.Handler {
 }
 
 const dcrRegisterBody = `{"redirect_uris":["https://client.example.com/callback"],"client_name":"Test Client","token_endpoint_auth_method":"none"}`
+
+// TestDCRRegisterIsRateLimited proves the /register route is wrapped by the
+// per-IP rate limiter (M1 throttle requirement). With the limiter dialed down to
+// a single request, the second /register from the same client is throttled with
+// 429 before reaching the handler, confirming withRateLimit applies to the
+// route. This is a light assertion: it does not exercise the production window.
+func TestDCRRegisterIsRateLimited(t *testing.T) {
+	config := &types.Config{
+		Mode:                            ModeForwardAuth,
+		OAuthClientID:                   "test_client_id",
+		OAuthClientSecret:               "test_client_secret",
+		OAuthAuthorizeURL:               "https://accounts.google.com",
+		ScopesSupported:                 "openid,profile,email",
+		EnableDynamicClientRegistration: boolPtr(true),
+	}
+	p, err := NewOAuthProxy(config)
+	if err != nil {
+		t.Skipf("Skipping test due to database connection error: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	// Replace the limiter with a 1-request-per-window one so the route's
+	// withRateLimit wrapper trips on the second request.
+	p.rateLimiter = ratelimit.NewRateLimiter(time.Minute, 1)
+	handler := p.GetHandler()
+
+	send := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/register", strings.NewReader(dcrRegisterBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "203.0.113.7:5555"
+		handler.ServeHTTP(w, req)
+		return w
+	}
+
+	require.NotEqual(t, http.StatusTooManyRequests, send().Code, "first request must not be throttled")
+	require.Equal(t, http.StatusTooManyRequests, send().Code, "second request from same IP must be throttled by withRateLimit")
+}
 
 // TestDCRDisabledByDefault asserts that with no explicit toggle (nil), DCR is
 // off: /register is forbidden and metadata omits registration_endpoint.

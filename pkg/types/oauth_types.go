@@ -29,8 +29,22 @@ type ClientInfo struct {
 	ResponseTypes           StringSlice `gorm:"type:text" json:"response_types,omitempty"`
 	RegistrationDate        int64       `json:"registration_date,omitempty"`
 	TokenEndpointAuthMethod string      `gorm:"default:client_secret_basic" json:"token_endpoint_auth_method"`
-	CreatedAt               time.Time   `gorm:"autoCreateTime" json:"-"`
-	UpdatedAt               time.Time   `gorm:"autoUpdateTime" json:"-"`
+
+	// Dynamic marks a client that was created via Dynamic Client Registration
+	// (RFC 7591, the /register endpoint) rather than statically provisioned. Only
+	// Dynamic clients are subject to the DCR cap and the TTL-based garbage
+	// collector (M1); statically-provisioned clients (Dynamic=false) are never
+	// counted against the cap nor GC'd.
+	Dynamic bool `gorm:"default:false" json:"-"`
+
+	// ExpiresAt is the Unix-second expiry of a DCR-registered client. A value of
+	// 0 means "never expires" (back-compat, and always the case for statically
+	// provisioned clients). When > 0 the client is rejected by GetClient once the
+	// wall clock passes it and is deleted by CleanupExpiredClients (M1).
+	ExpiresAt int64 `gorm:"default:0" json:"-"`
+
+	CreatedAt time.Time `gorm:"autoCreateTime" json:"-"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime" json:"-"`
 }
 
 // OAuthMetadata represents OAuth authorization server metadata

@@ -89,11 +89,53 @@ func (d *Store) setupSchema() error {
 	return nil
 }
 
-// GetClient retrieves a client by ID
+// GetClient retrieves a client by ID. M1: a DCR-registered client whose expiry
+// (expires_at, Unix seconds) has passed is treated as not-found, so an expired
+// client_id is rejected by the authorize/token/revoke lookups (invalid_client)
+// and can no longer be used. expires_at = 0 means "never expires" (statically
+// provisioned clients and back-compat DCR clients), so the filter keeps them.
 func (d *Store) GetClient(clientID string) (*types.ClientInfo, error) {
 	var client types.ClientInfo
-	err := d.db.First(&client, "client_id = ?", clientID).Error
+	err := d.db.First(&client, "client_id = ? AND (expires_at = 0 OR expires_at > ?)", clientID, time.Now().Unix()).Error
 	if err != nil {
+		return nil, err
+	}
+	return &client, nil
+}
+
+// CountDynamicClients returns the number of DCR-registered (Dynamic) clients
+// currently stored. It is an efficient COUNT (not a load-all) backing the M1
+// registration cap. Statically provisioned clients (Dynamic=false) are not
+// counted, so the cap only bounds attacker-reachable self-registration.
+func (d *Store) CountDynamicClients() (int64, error) {
+	var count int64
+	if err := d.db.Model(&types.ClientInfo{}).Where("dynamic = ?", true).Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("failed to count dynamic clients: %w", err)
+	}
+	return count, nil
+}
+
+// CleanupExpiredClients deletes DCR-registered clients whose TTL has elapsed
+// (M1). It only touches Dynamic clients with a positive, past expires_at, so
+// never-expiring DCR clients (expires_at = 0) and statically provisioned
+// clients (Dynamic=false) are always preserved.
+func (d *Store) CleanupExpiredClients() error {
+	result := d.db.Where("dynamic = ? AND expires_at > 0 AND expires_at < ?", true, time.Now().Unix()).Delete(&types.ClientInfo{})
+	if result.Error != nil {
+		return fmt.Errorf("failed to cleanup expired clients: %w", result.Error)
+	}
+	if result.RowsAffected > 0 {
+		fmt.Printf("Deleted %d expired dynamic clients\n", result.RowsAffected)
+	}
+	return nil
+}
+
+// rawGetClient retrieves a client by ID WITHOUT the GetClient expiry filter, so
+// tests can distinguish a row that was actually deleted (e.g. by
+// CleanupExpiredClients) from one merely hidden by the expiry check.
+func (d *Store) rawGetClient(clientID string) (*types.ClientInfo, error) {
+	var client types.ClientInfo
+	if err := d.db.First(&client, "client_id = ?", clientID).Error; err != nil {
 		return nil, err
 	}
 	return &client, nil
@@ -360,6 +402,12 @@ func (d *Store) CleanupExpiredTokens() error {
 	// Delete expired auth requests
 	if err := d.CleanupExpiredAuthRequests(); err != nil {
 		return fmt.Errorf("failed to cleanup expired auth requests: %w", err)
+	}
+
+	// M1: prune expired DCR-registered clients on the SAME cleanup pass (no
+	// second ticker). Never-expiring and statically provisioned clients survive.
+	if err := d.CleanupExpiredClients(); err != nil {
+		return fmt.Errorf("failed to cleanup expired clients: %w", err)
 	}
 
 	return nil

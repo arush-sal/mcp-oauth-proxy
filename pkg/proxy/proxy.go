@@ -625,7 +625,7 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	mux.HandleFunc("GET "+prefix+"/callback", p.withCORS(p.withRateLimit(callbackHandler)))
 	mux.HandleFunc("POST "+prefix+"/token", p.withCORS(p.withRateLimit(tokenHandler)))
 	mux.HandleFunc("POST "+prefix+"/revoke", p.withCORS(p.withRateLimit(revokeHandler)))
-	mux.HandleFunc("POST "+prefix+"/register", p.withCORS(p.withRateLimit(register.NewHandler(p.db, p.config.DCREnabled()))))
+	mux.HandleFunc("POST "+prefix+"/register", p.withCORS(p.withRateLimit(register.NewHandler(p.db, p.config.DCREnabled(), p.config.ResolvedMaxDynamicClients(), p.config.DynamicClientTTL))))
 
 	// Metadata endpoints
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", p.withCORS(p.oauthMetadataHandler))

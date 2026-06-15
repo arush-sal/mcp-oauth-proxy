@@ -78,21 +78,35 @@ func isLoopbackHost(host string) bool {
 
 type ClientStore interface {
 	StoreClient(client *types.ClientInfo) error
+	// CountDynamicClients returns the number of DCR-registered (Dynamic) clients
+	// currently stored. It backs the M1 cap check and must be an efficient COUNT,
+	// not a load-all.
+	CountDynamicClients() (int64, error)
 }
 
 // NewHandler builds the /register Dynamic Client Registration handler. When
 // enabled is false the handler is mounted but rejects every request with 403
 // (see ServeHTTP) so DCR can be turned off without unmounting the route.
-func NewHandler(db ClientStore, enabled bool) http.Handler {
+//
+// maxClients caps how many DCR-registered clients may exist at once (M1): when
+// > 0, a registration that would exceed the cap is rejected before storing;
+// 0 means unlimited. ttl, when > 0, stamps each newly registered client with an
+// expiry of issued_at+ttl so it is later rejected at lookup and garbage-collected
+// (M1); 0 means the client never expires.
+func NewHandler(db ClientStore, enabled bool, maxClients int, ttl time.Duration) http.Handler {
 	return &Handler{
-		db:      db,
-		enabled: enabled,
+		db:         db,
+		enabled:    enabled,
+		maxClients: maxClients,
+		ttl:        ttl,
 	}
 }
 
 type Handler struct {
-	db      ClientStore
-	enabled bool
+	db         ClientStore
+	enabled    bool
+	maxClients int
+	ttl        time.Duration
 }
 
 func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -161,6 +175,30 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// M1 (cap): before storing, reject when the DCR client count is at/over the
+	// configured cap so an unauthenticated attacker cannot fill the database. A
+	// cap of 0 means unlimited (skip the check). The count is an efficient COUNT,
+	// not a load-all. We return 429 Too Many Requests (the registrations are
+	// rate/quota-limited) with a clear RFC 7591-style error and do NOT store.
+	if p.maxClients > 0 {
+		count, err := p.db.CountDynamicClients()
+		if err != nil {
+			log.Printf("Failed to count dynamic clients: %v", err)
+			handlerutils.JSON(w, http.StatusInternalServerError, types.OAuthError{
+				Error:            "server_error",
+				ErrorDescription: "Failed to register client",
+			})
+			return
+		}
+		if count >= int64(p.maxClients) {
+			handlerutils.JSON(w, http.StatusTooManyRequests, types.OAuthError{
+				Error:            "invalid_client_metadata",
+				ErrorDescription: fmt.Sprintf("dynamic client registration limit reached (%d); no new clients can be registered", p.maxClients),
+			})
+			return
+		}
+	}
+
 	// Generate client ID and secret
 	clientID := encryption.GenerateRandomString(16)
 	clientSecret := ""
@@ -171,9 +209,18 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set registration date
+	now := time.Now()
 	clientInfo.ClientID = clientID
 	clientInfo.ClientSecret = clientSecret
-	clientInfo.RegistrationDate = time.Now().Unix()
+	clientInfo.RegistrationDate = now.Unix()
+
+	// M1 (TTL): when a TTL is configured, stamp the client with an expiry of
+	// issued_at+ttl so it is rejected at lookup and garbage-collected once stale.
+	// A zero TTL leaves ExpiresAt at 0 (never expires), preserving back-compat.
+	var expiresAt int64
+	if p.ttl > 0 {
+		expiresAt = now.Add(p.ttl).Unix()
+	}
 
 	// Convert to database.ClientInfo
 	dbClientInfo := &types.ClientInfo{
@@ -191,6 +238,10 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ResponseTypes:           clientInfo.ResponseTypes,
 		RegistrationDate:        clientInfo.RegistrationDate,
 		TokenEndpointAuthMethod: clientInfo.TokenEndpointAuthMethod,
+		// Mark as DCR-registered so it counts against the cap and is subject to
+		// the TTL-based GC; statically provisioned clients keep Dynamic=false.
+		Dynamic:   true,
+		ExpiresAt: expiresAt,
 	}
 
 	// Store client in database
