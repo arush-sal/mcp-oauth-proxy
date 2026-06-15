@@ -12,6 +12,16 @@ import (
 // newTestStore (db-package isolated SQLite store helper) is defined in
 // revoke_by_grant_test.go and reused here.
 
+// rawGetClient bypasses the GetClient expiry filter so tests can distinguish a
+// deleted row from one merely hidden by the expiry check.
+func (d *Store) rawGetClient(clientID string) (*types.ClientInfo, error) {
+	var client types.ClientInfo
+	if err := d.db.First(&client, "client_id = ?", clientID).Error; err != nil {
+		return nil, err
+	}
+	return &client, nil
+}
+
 // TestGetClientRejectsExpired proves the authorize/token client lookup
 // (GetClient) treats an expired DCR client as not-found, while a within-TTL
 // client and a never-expiring (ExpiresAt=0) client both resolve. This is the

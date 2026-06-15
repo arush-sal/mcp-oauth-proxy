@@ -130,17 +130,6 @@ func (d *Store) CleanupExpiredClients() error {
 	return nil
 }
 
-// rawGetClient retrieves a client by ID WITHOUT the GetClient expiry filter, so
-// tests can distinguish a row that was actually deleted (e.g. by
-// CleanupExpiredClients) from one merely hidden by the expiry check.
-func (d *Store) rawGetClient(clientID string) (*types.ClientInfo, error) {
-	var client types.ClientInfo
-	if err := d.db.First(&client, "client_id = ?", clientID).Error; err != nil {
-		return nil, err
-	}
-	return &client, nil
-}
-
 // StoreClient stores a new client
 func (d *Store) StoreClient(client *types.ClientInfo) error {
 	return d.db.Create(client).Error

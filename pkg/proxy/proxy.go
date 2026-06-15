@@ -651,7 +651,7 @@ func (p *OAuthProxy) GetHandler() http.Handler {
 	// Instrument the whole handler with Prometheus middleware when metrics are
 	// enabled. This counts every request (by code/method) and records request
 	// duration, including the probe and metrics endpoints themselves.
-	var handler http.Handler = loggedHandler
+	var handler = loggedHandler
 	if p.metrics != nil {
 		handler = p.metrics.instrument(loggedHandler)
 	}
