@@ -5,6 +5,8 @@
 # Documentation
 README.md
 *.md
+docs/build/
+docs/node_modules/
 
 # Docker
 Dockerfile
@@ -43,6 +45,8 @@ config.production.yaml
 
 # Build artifacts
 oauth-proxy
+coverage*.out
+coverage*.html
 *.exe
 *.dll
 *.so

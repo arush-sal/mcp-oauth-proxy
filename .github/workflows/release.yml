@@ -5,12 +5,94 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 env:
-  GO_VERSION: "1.25"
+  TRIVY_SKIP_VERSION_CHECK: "true"
 
 jobs:
-  test:
+  trivy-filesystem:
+    name: Trivy ${{ matrix.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: application
+            scan-ref: .
+            scanners: vuln,secret
+            skip-dirs: docs,.github,.git
+          - name: github-actions
+            scan-ref: .github/workflows
+            scanners: secret
+            skip-dirs: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Scan ${{ matrix.name }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ matrix.scan-ref }}
+          scanners: ${{ matrix.scanners }}
+          skip-dirs: ${{ matrix.skip-dirs }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          cache: false
+          timeout: 10m
+
+  zizmor:
+    name: Zizmor GitHub Actions audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Audit GitHub Actions workflows
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          inputs: .github
+          version: 1.25.2
+          min-severity: high
+          advanced-security: false
+          annotations: true
+
+  govulncheck:
+    name: Govulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
+
+      - name: Run govulncheck
+        run: govulncheck ./...
+
+  test:
+    needs: [trivy-filesystem, zizmor, govulncheck]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:15
@@ -28,23 +110,21 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: go.mod
+          cache: false
 
       - name: Install dependencies
         run: go mod download
 
-      - name: Set Go toolchain
-        run: go env -w GOTOOLCHAIN=go1.25.0+auto
-
       - name: Run linter
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
         with:
-          version: v2.4.0
+          version: v2.12.2
           args: --timeout=5m --tests=false
 
       - name: Run tests
@@ -57,6 +137,7 @@ jobs:
   build-linux:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         include:
@@ -70,51 +151,27 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install dependencies
-        run: go mod download
-
-      - name: Get version
-        id: version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          go-version-file: go.mod
+          cache: false
 
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1
+          CGO_ENABLED: "0"
         run: |
-          # Install cross-compilation tools for CGO (needed for SQLite)
-          if [ "${{ matrix.goos }}" = "linux" ]; then
-            if [ "${{ matrix.goarch }}" = "arm64" ]; then
-              sudo apt-get update
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              export CC=aarch64-linux-gnu-gcc
-            fi
-          elif [ "${{ matrix.goos }}" = "darwin" ]; then
-            # For macOS, we'll use a different approach with osxcross or build on macOS runners
-            echo "Building for macOS..."
-          fi
-
           mkdir -p dist
-          binary_name="mcp-oauth-proxy-${{ matrix.name }}"
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            binary_name="${binary_name}.exe"
-          fi
-
-          go build -o "dist/${binary_name}" \
-            -ldflags="-X main.version=${{ steps.version.outputs.VERSION }} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -s -w" \
+          go build -o "dist/mcp-oauth-proxy-${{ matrix.name }}" \
+            -ldflags="-X main.version=${GITHUB_REF_NAME} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -s -w" \
             .
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.name }}
           path: dist/
@@ -123,6 +180,7 @@ jobs:
   build-macos:
     needs: test
     runs-on: macos-latest
+    timeout-minutes: 20
     strategy:
       matrix:
         include:
@@ -133,36 +191,27 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Install dependencies
-        run: go mod download
-
-      - name: Get version
-        id: version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          go-version-file: go.mod
+          cache: false
 
       - name: Build binary
         env:
           GOOS: darwin
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 1
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          binary_name="mcp-oauth-proxy-${{ matrix.name }}"
-
-          go build -o "dist/${binary_name}" \
-            -ldflags="-X main.version=${{ steps.version.outputs.VERSION }} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -s -w" \
+          go build -o "dist/mcp-oauth-proxy-${{ matrix.name }}" \
+            -ldflags="-X main.version=${GITHUB_REF_NAME} -X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ) -s -w" \
             .
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.name }}
           path: dist/
@@ -171,14 +220,11 @@ jobs:
   create-universal-macos:
     needs: build-macos
     runs-on: macos-latest
-    steps:
-      - name: Get version
-        id: version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+    timeout-minutes: 10
 
+    steps:
       - name: Download macOS binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-darwin-*
           path: ./binaries/
@@ -186,22 +232,15 @@ jobs:
       - name: Create universal binary
         run: |
           mkdir -p dist
-
-          # Find the actual binary files
           amd64_binary=$(find ./binaries -name "*darwin-amd64*" -type f | head -1)
           arm64_binary=$(find ./binaries -name "*darwin-arm64*" -type f | head -1)
-
-          echo "AMD64 binary: $amd64_binary"
-          echo "ARM64 binary: $arm64_binary"
-
-          # Create universal binary
-          lipo -create \
-            "$amd64_binary" \
-            "$arm64_binary" \
+          test -n "$amd64_binary"
+          test -n "$arm64_binary"
+          lipo -create "$amd64_binary" "$arm64_binary" \
             -output "dist/mcp-oauth-proxy-darwin-universal"
 
       - name: Upload universal binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-darwin-universal
           path: dist/
@@ -210,24 +249,30 @@ jobs:
   docker:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      image: ${{ steps.image.outputs.reference }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Get version
-        id: version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Set image reference
+        id: image
+        run: echo "reference=ghcr.io/${GITHUB_REPOSITORY_OWNER}/mcp-oauth-proxy" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -235,16 +280,17 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/mcp-oauth-proxy
+          images: ${{ steps.image.outputs.reference }}
           tags: |
             type=ref,event=tag
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           push: true
@@ -252,94 +298,190 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64
           build-args: |
-            VERSION=${{ steps.version.outputs.VERSION }}
+            VERSION=${{ github.ref_name }}
             BUILD_TIME=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+
+  image-scan:
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan release image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ needs.docker.outputs.image }}@${{ needs.docker.outputs.digest }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          timeout: 10m
+
+  sign-image:
+    needs: [docker, image-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.1
+
+      - name: Sign Docker image
+        env:
+          IMAGE: ${{ needs.docker.outputs.image }}
+          DIGEST: ${{ needs.docker.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+  sbom:
+    needs: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate CycloneDX JSON SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ needs.docker.outputs.image }}@${{ needs.docker.outputs.digest }}
+          format: cyclonedx
+          output: mcp-oauth-proxy-sbom.cdx.json
+          timeout: 10m
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-sbom
+          path: mcp-oauth-proxy-sbom.cdx.json
+          retention-days: 90
 
   release:
-    needs: [build-linux, build-macos, create-universal-macos, docker]
+    needs:
+      - build-linux
+      - build-macos
+      - create-universal-macos
+      - docker
+      - image-scan
+      - sign-image
+      - sbom
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
+      id-token: write
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
-      - name: Get version
-        id: version
-        run: |
-          echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Download binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: binary-*
           path: ./artifacts/
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-sbom
+          path: ./artifacts/sbom/
 
       - name: Prepare release assets
         run: |
           mkdir -p release
           find ./artifacts -type f -name "mcp-oauth-proxy-*" -exec cp {} release/ \;
+          (
+            cd release
+            sha256sum mcp-oauth-proxy-* > checksums.txt
+          )
+          ls -la release
 
-          # Create checksums
-          cd release
-          sha256sum * > checksums.txt
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.1
 
-          # List files for verification
-          echo "Release files:"
-          ls -la
+      - name: Sign checksums and SBOM
+        run: |
+          cosign sign-blob --yes \
+            --bundle release/checksums.txt.sigstore.json \
+            release/checksums.txt
+          cosign sign-blob --yes \
+            --bundle release/mcp-oauth-proxy-sbom.cdx.json.sigstore.json \
+            release/mcp-oauth-proxy-sbom.cdx.json
 
       - name: Generate changelog
-        id: changelog
         run: |
-          cat << 'EOF' > CHANGELOG.md
-          ## What's Changed in ${{ steps.version.outputs.VERSION }}
+          cat << EOF > CHANGELOG.md
+          ## What's Changed in ${GITHUB_REF_NAME}
 
-          ### 🚀 Features
-          - Cross-platform release with native binaries for Linux and macOS
-          - Multi-architecture Docker images for Linux (AMD64 and ARM64)
+          ### Release Assets
+          - Native Linux and macOS binaries
+          - macOS universal binary
+          - CycloneDX JSON SBOM
+          - SHA-256 checksums
+          - Sigstore bundles for the checksums and SBOM
 
-          ### 📦 Binary Downloads
-          - **Linux AMD64**: `mcp-oauth-proxy-${{ steps.version.outputs.VERSION }}-linux-amd64`
-          - **Linux ARM64**: `mcp-oauth-proxy-${{ steps.version.outputs.VERSION }}-linux-arm64`
-          - **macOS Universal**: `mcp-oauth-proxy-${{ steps.version.outputs.VERSION }}-darwin-universal` (Intel + Apple Silicon)
-          - **macOS AMD64**: `mcp-oauth-proxy-${{ steps.version.outputs.VERSION }}-darwin-amd64` (Intel)
-          - **macOS ARM64**: `mcp-oauth-proxy-${{ steps.version.outputs.VERSION }}-darwin-arm64` (Apple Silicon)
+          ### Docker Image
+          - \`${{ needs.docker.outputs.image }}@${{ needs.docker.outputs.digest }}\`
+          - Platforms: linux/amd64, linux/arm64
+          - Signed keylessly with Cosign through GitHub OIDC
 
-          ### 🐳 Docker Images
-          - **Tagged Release**: `ghcr.io/${{ github.repository_owner }}/mcp-oauth-proxy:${{ steps.version.outputs.VERSION }}`
-          - **Latest**: `ghcr.io/${{ github.repository_owner }}/mcp-oauth-proxy:latest`
-          - **Platforms**: linux/amd64, linux/arm64
+          ### Verification
+          Verify the image with Cosign:
 
-          ### 🔍 Verification
-          All binaries can be verified using the included `checksums.txt` file.
+          \`\`\`bash
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ needs.docker.outputs.image }}@${{ needs.docker.outputs.digest }}"
+          \`\`\`
 
-          ### 🛠️ Installation
-
-          **Binary Installation:**
-          1. Download the appropriate binary for your platform
-          2. Make it executable: `chmod +x mcp-oauth-proxy-*`
-          3. Move to your PATH: `mv mcp-oauth-proxy-* /usr/local/bin/mcp-oauth-proxy`
-
-          **Docker Installation:**
-          ```bash
-          docker pull ghcr.io/${{ github.repository_owner }}/mcp-oauth-proxy:${{ steps.version.outputs.VERSION }}
-          # or
-          docker pull ghcr.io/${{ github.repository_owner }}/mcp-oauth-proxy:latest
-          ```
-
-          **Full Changelog**: https://github.com/${{ github.repository }}/commits/${{ steps.version.outputs.VERSION }}
+          **Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}
           EOF
 
       - name: Create Release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
-          tag: ${{ steps.version.outputs.VERSION }}
-          name: Release ${{ steps.version.outputs.VERSION }}
+          tag: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           bodyFile: CHANGELOG.md
           artifacts: "release/*"
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
           token: ${{ secrets.GITHUB_TOKEN }}
           generateReleaseNotes: true
           allowUpdates: true
