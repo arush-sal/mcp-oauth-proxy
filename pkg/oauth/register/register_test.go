@@ -107,6 +107,16 @@ func TestRegisterRedirectURIValidation(t *testing.T) {
 		{"scheme-relative rejected", "//evil.com/path", false},
 		// Hostless https (Blocker 1) must be rejected.
 		{"hostless https rejected", "https:///path", false},
+		// Private-use URI schemes (RFC 8252 §7.1) for native apps are accepted:
+		// authority form (Cursor), no-authority form, and reverse-DNS form.
+		{"private-use scheme authority accepted", "cursor://anysphere.cursor-mcp/oauth/callback", true},
+		{"private-use scheme no-authority accepted", "com.example.app:/oauth/callback", true},
+		{"reverse-dns private-use scheme accepted", "com.googleusercontent.apps.123:/cb", true},
+		// Dangerous / non-app schemes are rejected even though they are not http(s).
+		{"javascript scheme rejected", "javascript:alert(1)", false},
+		{"data scheme rejected", "data:text/html,evil", false},
+		{"file scheme rejected", "file:///etc/passwd", false},
+		{"mailto scheme rejected", "mailto:a@b.com", false},
 	}
 
 	for _, tc := range cases {

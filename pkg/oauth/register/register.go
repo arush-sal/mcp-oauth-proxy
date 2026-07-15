@@ -15,12 +15,21 @@ import (
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 )
 
-// validateRedirectURI enforces the H1 DCR redirect URI allowlist. A URI is
-// accepted only when it is https (any host) or loopback http
-// (127.0.0.1 / localhost / [::1], optional port/path). For every URI a URL
-// fragment, embedded credentials (user:pass@) and a wildcard ("*") are
-// rejected. Non-loopback http is rejected. The returned error is suitable as
-// the description of an RFC 7591 invalid_redirect_uri response.
+// validateRedirectURI enforces the DCR redirect URI allowlist (RFC 7591
+// invalid_redirect_uri). Accepted:
+//   - https with a host (any host);
+//   - loopback http (127.0.0.1 / localhost / [::1], optional port/path);
+//   - a private-use URI scheme (RFC 8252 §7.1) for native apps, e.g.
+//     "cursor://anysphere.cursor-mcp/oauth/callback" or "com.example.app:/cb".
+//
+// For every URI a fragment, embedded credentials (user:pass@) and a wildcard
+// ("*") are rejected. Non-loopback http is rejected. Private-use schemes must be
+// syntactically valid (RFC 3986) and are denied when they name a known
+// dangerous / non-app scheme (javascript, data, file, ...). A custom-scheme
+// redirect can only be delivered to an app registered for that scheme on the
+// user's own device, so unlike an attacker-controlled https host it is not a
+// remote code-interception vector; the identity allowlist + PKCE remain the
+// primary gate.
 func validateRedirectURI(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("redirect URI must not be empty")
@@ -45,24 +54,93 @@ func validateRedirectURI(raw string) error {
 		return fmt.Errorf("redirect URI %q must not contain embedded credentials", raw)
 	}
 
-	// A redirect URI must always carry a host; a hostless URI such as
-	// "https:///path" (url.Parse yields scheme=https, host="") is never a valid
-	// redirect target.
-	if u.Hostname() == "" {
-		return fmt.Errorf("redirect URI %q must have a host", raw)
-	}
-
+	// Classify by scheme (case-insensitive per RFC 3986). Never rewrite the raw
+	// value: /authorize and /token compare redirect_uri by exact string, so any
+	// normalization must stay confined to this validation.
 	switch strings.ToLower(u.Scheme) {
 	case "https":
+		// https must carry a host; "https:///path" is not a valid target.
+		if u.Hostname() == "" {
+			return fmt.Errorf("redirect URI %q must have a host", raw)
+		}
 		return nil
 	case "http":
+		if u.Hostname() == "" {
+			return fmt.Errorf("redirect URI %q must have a host", raw)
+		}
 		if isLoopbackHost(u.Hostname()) {
 			return nil
 		}
-		return fmt.Errorf("redirect URI %q uses http with a non-loopback host; only https or loopback http is allowed", raw)
+		return fmt.Errorf("redirect URI %q uses http with a non-loopback host; only https, loopback http, or a private-use URI scheme is allowed", raw)
 	default:
-		return fmt.Errorf("redirect URI %q must use https or loopback http", raw)
+		// Private-use URI scheme (RFC 8252 §7.1). Authority is optional: both
+		// "scheme://host/path" and "scheme:/path" are legitimate native-app forms,
+		// so we do NOT require a host here.
+		return validatePrivateUseScheme(u.Scheme, raw)
 	}
+}
+
+// deniedRedirectSchemes lists schemes that are never valid native-app redirect
+// targets and are dangerous if a redirect value is ever dereferenced in a
+// browser-like context (code execution, local file / inline data access) or are
+// simply not app-callback schemes.
+var deniedRedirectSchemes = map[string]bool{
+	"javascript": true,
+	"data":       true,
+	"vbscript":   true,
+	"file":       true,
+	"blob":       true,
+	"about":      true,
+	"mailto":     true,
+	"tel":        true,
+	"urn":        true,
+	"ws":         true,
+	"wss":        true,
+}
+
+// validatePrivateUseScheme accepts an RFC 8252 §7.1 private-use URI scheme. The
+// scheme must be syntactically valid per RFC 3986 and bounded in length, and
+// must not be a known dangerous / non-app scheme. Per RFC 8252 a reverse-DNS
+// scheme ("com.example.app") is RECOMMENDED but NOT required, so single-label
+// schemes such as "cursor" are deliberately allowed - requiring a dot would
+// break real clients (e.g. Cursor).
+func validatePrivateUseScheme(scheme, raw string) error {
+	if scheme == "" {
+		return fmt.Errorf("redirect URI %q must have a scheme", raw)
+	}
+	if len(scheme) > 64 {
+		return fmt.Errorf("redirect URI %q has an overly long scheme", raw)
+	}
+	if !isValidURIScheme(scheme) {
+		return fmt.Errorf("redirect URI %q has an invalid scheme", raw)
+	}
+	if deniedRedirectSchemes[strings.ToLower(scheme)] {
+		return fmt.Errorf("redirect URI %q uses a disallowed scheme %q", raw, scheme)
+	}
+	return nil
+}
+
+// isValidURIScheme reports whether s matches the RFC 3986 scheme grammar:
+// ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+func isValidURIScheme(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+			// A letter is valid in any position.
+		case (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.':
+			// Digit / "+" / "-" / "." allowed only after the first character.
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // isLoopbackHost reports whether host is a permitted loopback target for an
