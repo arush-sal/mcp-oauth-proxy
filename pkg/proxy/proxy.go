@@ -891,20 +891,43 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 
 		// Create reverse proxy
 		proxy := &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				req.Header.Set("X-Forwarded-Host", req.Host)
-				req.Header.Set("X-Forwarded-Proto", req.URL.Scheme)
+			// Rewrite (not the deprecated Director) runs after hop-by-hop
+			// removal, so a client's Connection header cannot drop the headers
+			// written here. ReverseProxy strips inbound Forwarded and
+			// X-Forwarded-For/Host/Proto before calling Rewrite; they are
+			// re-set below to match the previous Director behavior.
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				out := pr.Out
+				// Keep the client's Forwarded and X-Forwarded-For chain (the
+				// peer IP is appended by SetXForwarded), as Director did.
+				// SetXForwarded sets X-Forwarded-Host to the inbound Host;
+				// X-Forwarded-Proto is then reset to the inbound URL scheme
+				// (empty for server requests), which is what Director sent.
+				if v := pr.In.Header.Values("Forwarded"); len(v) > 0 {
+					out.Header["Forwarded"] = v
+				}
+				out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"]
+				pr.SetXForwarded()
+				out.Header.Set("X-Forwarded-Proto", pr.In.URL.Scheme)
 
+				// Rewrite always drops unparsable query params; Director only did
+				// so when the inbound form had been parsed. Keep the raw query.
+				if pr.In.Form == nil {
+					out.URL.RawQuery = pr.In.URL.RawQuery
+				}
+
+				// Only scheme and host change; path and query stay as inbound
+				// (SetURL would join paths and is deliberately not used).
 				newURL, _ := url.Parse(targetURL)
-				req.URL.Scheme = newURL.Scheme
-				req.URL.Host = newURL.Host
-				req.Host = newURL.Host
+				out.URL.Scheme = newURL.Scheme
+				out.URL.Host = newURL.Host
+				out.Host = newURL.Host
 
 				// Add forwarded headers from token props. setHeaders deletes any
 				// inbound Authorization first, then applies the configured
 				// forwarding policy, so a forwarded token (if any) is the final
 				// Authorization value.
-				p.setHeaders(req.Header, tokenInfo.Props)
+				p.setHeaders(out.Header, tokenInfo.Props)
 			},
 			ModifyResponse: func(resp *http.Response) error {
 				// Rewrite Location header to use proxy host instead of downstream server host
@@ -944,7 +967,7 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 // Any inbound Authorization is deleted FIRST so a spoofed value can never
 // survive into the upstream request, regardless of policy. The forwarding
 // policy then sets the Authorization (or the configured custom id_token header)
-// when configured to do so. This makes both call sites (the proxy Director and
+// when configured to do so. This makes both call sites (the proxy Rewrite and
 // forward_auth mode) consistent and spoof-safe.
 func (p *OAuthProxy) setHeaders(header http.Header, props map[string]any) {
 	// F3: optional inbound header hygiene. When enabled, strip the full family of

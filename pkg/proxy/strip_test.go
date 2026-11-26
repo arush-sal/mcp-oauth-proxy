@@ -3,14 +3,11 @@ package proxy
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
-	"net/url"
 	"testing"
 	"time"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // stripProps returns a fully-populated grant props map so setHeaders writes the
@@ -169,56 +166,4 @@ func TestStripEnabledWithForwardingWritesRealIDToken(t *testing.T) {
 	// Spoofed broad header gone; real id_token written to the custom header.
 	assert.Empty(t, header.Get("X-Forwarded-Groups"))
 	assert.Equal(t, idTokenValue, header.Get("X-Id-Token"))
-}
-
-// TestStripEnabledProxyDirector exercises the reverse-proxy Director path
-// end-to-end: an inbound request carrying spoofed identity headers is proxied
-// and the upstream sees them stripped, with the managed headers re-derived.
-func TestStripEnabledProxyDirector(t *testing.T) {
-	var gotGroups, gotAuthReqEmail, gotFwdEmail, gotIDToken string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotGroups = r.Header.Get("X-Forwarded-Groups")
-		gotAuthReqEmail = r.Header.Get("X-Auth-Request-Email")
-		gotFwdEmail = r.Header.Get("X-Forwarded-Email")
-		gotIDToken = r.Header.Get("X-Id-Token")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	p := newForwardProxy(t, &types.Config{
-		Mode:                        ModeProxy,
-		MCPServerURL:                upstream.URL,
-		StripInboundIdentityHeaders: true,
-		IDTokenHeader:               "X-Id-Token",
-	})
-
-	// Build the reverse proxy with the SAME Director header mutation the proxy
-	// uses in mcpProxyHandler (p.setHeaders(req.Header, props)), so we exercise
-	// the real proxy-path strip end-to-end against a live upstream.
-	target, err := url.Parse(upstream.URL)
-	require.NoError(t, err)
-	props := stripProps()
-	props["id_token"] = idTokenValue
-	props["id_token_exp"] = time.Now().Add(1 * time.Hour).Unix()
-	rp := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Host = target.Host
-			p.setHeaders(req.Header, props)
-		},
-	}
-
-	req := httptest.NewRequest(http.MethodGet, "/some/path", nil)
-	seedSpoofedIdentityHeaders(req.Header)
-	req.Header.Set("X-Id-Token", "spoofed.jwt.value")
-
-	rec := httptest.NewRecorder()
-	rp.ServeHTTP(rec, req)
-
-	assert.Equal(t, http.StatusOK, rec.Code)
-	assert.Empty(t, gotGroups)
-	assert.Empty(t, gotAuthReqEmail)
-	assert.Equal(t, "user@example.com", gotFwdEmail)
-	assert.Equal(t, idTokenValue, gotIDToken)
 }

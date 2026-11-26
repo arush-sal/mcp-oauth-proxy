@@ -41,7 +41,7 @@ const (
 // STRIP_INBOUND_IDENTITY_HEADERS is enabled (F3). The names mirror oauth2-proxy
 // so behavior is familiar. It deliberately EXCLUDES routing/transport headers
 // (X-Forwarded-Host, X-Forwarded-Proto, X-Forwarded-For, X-Forwarded-Uri):
-// those are not identity signals and the proxy Director sets Host/Proto itself.
+// those are not identity signals and the proxy Rewrite sets Host/Proto itself.
 //
 // The proxy-managed four (X-Forwarded-User/Email/Name/Access-Token) and
 // Authorization are listed here for an explicit pre-strip, even though
