@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"testing"
 
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/providers"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"github.com/stretchr/testify/assert"
@@ -66,7 +67,7 @@ func newAuthorizeRequest(clientID, redirectURI, challenge, method string) *http.
 
 func newHandlerFor(client *types.ClientInfo) (http.Handler, *fakeStore) {
 	store := &fakeStore{client: client}
-	h := NewHandler(store, mockProvider{}, []string{"openid"}, "upstream-id", "upstream-secret", "/oauth")
+	h := NewHandler(store, mockProvider{}, []string{"openid"}, "upstream-id", "upstream-secret", "/oauth", nil)
 	return h, store
 }
 
@@ -152,4 +153,47 @@ func TestAuthorizeConfidentialClientChallengeOptional(t *testing.T) {
 	h.ServeHTTP(w, newAuthorizeRequest("confidential", redirectURI, "", ""))
 	require.Equal(t, http.StatusFound, w.Code, "body: %s", w.Body.String())
 	assert.Len(t, store.stored, 1)
+}
+
+// TestAuthorizeHTTPSRedirectHostPolicy verifies that a client registered before
+// DCR_ALLOWED_REDIRECT_HOSTS was tightened cannot keep using a disallowed https
+// redirect host, while allowed hosts and loopback are unaffected.
+func TestAuthorizeHTTPSRedirectHostPolicy(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      string
+		uri      string
+		accepted bool
+	}{
+		{"allowed host passes", "app.example", "https://app.example/cb", true},
+		{"allowed host case-insensitive", "app.example", "https://APP.example/cb", true},
+		{"disallowed host rejected", "other.example", "https://app.example/cb", false},
+		{"none rejects https", "none", "https://app.example/cb", false},
+		{"empty rejects https", "", "https://app.example/cb", false},
+		{"loopback unaffected by none", "none", "http://127.0.0.1:5555/cb", true},
+		{"private-use unaffected by none", "none", "cursor://anysphere.cursor-mcp/cb", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			policy, err := handlerutils.ParseHTTPSRedirectHosts(tc.cfg)
+			require.NoError(t, err)
+			client := &types.ClientInfo{
+				ClientID:                "public",
+				TokenEndpointAuthMethod: "none",
+				RedirectUris:            []string{tc.uri},
+			}
+			store := &fakeStore{client: client}
+			h := NewHandler(store, mockProvider{}, []string{"openid"}, "upstream-id", "upstream-secret", "/oauth", policy)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, newAuthorizeRequest("public", tc.uri, "abc123challenge", "S256"))
+			if tc.accepted {
+				require.Equal(t, http.StatusFound, w.Code, "body: %s", w.Body.String())
+				return
+			}
+			require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			assert.Contains(t, w.Body.String(), "invalid_request")
+			assert.Contains(t, w.Body.String(), "Invalid redirect URI")
+			assert.Empty(t, store.stored)
+		})
+	}
 }

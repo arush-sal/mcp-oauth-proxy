@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/obot-platform/mcp-oauth-proxy/pkg/handlerutils"
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -52,7 +53,7 @@ const registerBody = `{"redirect_uris":["https://client.example.com/callback"],"
 // persists a client.
 func TestRegisterEnabledStoresClient(t *testing.T) {
 	store := newFakeStore()
-	h := NewHandler(store, true, 0, 0)
+	h := NewHandler(store, true, 0, 0, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
@@ -67,7 +68,7 @@ func TestRegisterEnabledStoresClient(t *testing.T) {
 // and an OAuthError body, and does NOT store anything.
 func TestRegisterDisabledForbidden(t *testing.T) {
 	store := newFakeStore()
-	h := NewHandler(store, false, 0, 0)
+	h := NewHandler(store, false, 0, 0, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
@@ -122,7 +123,7 @@ func TestRegisterRedirectURIValidation(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newFakeStore()
-			h := NewHandler(store, true, 0, 0)
+			h := NewHandler(store, true, 0, 0, nil)
 
 			// Build the body with json.Marshal so backslash-containing or
 			// otherwise special URIs are not accidentally malformed by string
@@ -164,7 +165,7 @@ func TestExistingClientStillResolvesWhenDisabled(t *testing.T) {
 	require.NoError(t, store.StoreClient(existing))
 
 	// DCR is disabled: /register is forbidden.
-	h := NewHandler(store, false, 0, 0)
+	h := NewHandler(store, false, 0, 0, nil)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
 	h.ServeHTTP(w, req)
@@ -182,7 +183,7 @@ func TestExistingClientStillResolvesWhenDisabled(t *testing.T) {
 func TestRegisterCapEnforced(t *testing.T) {
 	store := newFakeStore()
 	const cap = 2
-	h := NewHandler(store, true, cap, 0)
+	h := NewHandler(store, true, cap, 0, nil)
 
 	register := func() *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
@@ -209,7 +210,7 @@ func TestRegisterCapEnforced(t *testing.T) {
 // TestRegisterCapUnlimited proves a cap of 0 means unlimited (no rejection).
 func TestRegisterCapUnlimited(t *testing.T) {
 	store := newFakeStore()
-	h := NewHandler(store, true, 0, 0)
+	h := NewHandler(store, true, 0, 0, nil)
 	for i := 0; i < 5; i++ {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
@@ -224,7 +225,7 @@ func TestRegisterCapUnlimited(t *testing.T) {
 func TestRegisterTTLStamped(t *testing.T) {
 	t.Run("ttl set => future expiry", func(t *testing.T) {
 		store := newFakeStore()
-		h := NewHandler(store, true, 0, time.Hour)
+		h := NewHandler(store, true, 0, time.Hour, nil)
 		before := time.Now().Unix()
 
 		w := httptest.NewRecorder()
@@ -241,7 +242,7 @@ func TestRegisterTTLStamped(t *testing.T) {
 
 	t.Run("ttl zero => never expires", func(t *testing.T) {
 		store := newFakeStore()
-		h := NewHandler(store, true, 0, 0)
+		h := NewHandler(store, true, 0, 0, nil)
 
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/register", strings.NewReader(registerBody))
@@ -253,4 +254,70 @@ func TestRegisterTTLStamped(t *testing.T) {
 			assert.Equal(t, int64(0), c.ExpiresAt, "TTL=0 must leave the client never-expiring")
 		}
 	})
+}
+
+// TestRegisterHTTPSRedirectHostPolicy covers DCR_ALLOWED_REDIRECT_HOSTS: unset
+// (nil policy, any https host), "none"/empty (no https), and a host list.
+func TestRegisterHTTPSRedirectHostPolicy(t *testing.T) {
+	const (
+		httpsAllowed    = "https://claude.ai/api/mcp/auth_callback"
+		httpsDisallowed = "https://attacker.example/cb"
+		loopback        = "http://127.0.0.1:1234/cb"
+		privateUse      = "cursor://anysphere.cursor-mcp/oauth/callback"
+	)
+	cases := []struct {
+		name     string
+		set      bool
+		cfg      string
+		uri      string
+		accepted bool
+	}{
+		{"unset: any https accepted", false, "", httpsDisallowed, true},
+		{"unset: loopback accepted", false, "", loopback, true},
+		{"none: https rejected", true, "none", httpsAllowed, false},
+		{"none: NONE case-insensitive", true, "NONE", httpsAllowed, false},
+		{"none: loopback accepted", true, "none", loopback, true},
+		{"none: private-use accepted", true, "none", privateUse, true},
+		{"empty-but-set: https rejected", true, "", httpsAllowed, false},
+		{"empty-but-set: loopback accepted", true, "", loopback, true},
+		{"empty-but-set: private-use accepted", true, "", privateUse, true},
+		{"list: allowed host accepted", true, "claude.ai,chatgpt.com", httpsAllowed, true},
+		{"list: second entry accepted", true, "claude.ai, chatgpt.com ,", "https://chatgpt.com/cb", true},
+		{"list: disallowed host rejected", true, "claude.ai,chatgpt.com", httpsDisallowed, false},
+		{"list: uri host case-insensitive", true, "claude.ai", "https://Claude.AI/cb", true},
+		{"list: config case-insensitive", true, "Claude.AI", httpsAllowed, true},
+		{"list: no suffix match", true, "claude.ai", "https://evil.claude.ai/cb", false},
+		{"list: no prefix match", true, "claude.ai", "https://claude.ai.evil.com/cb", false},
+		{"list: explicit port on allowed host accepted", true, "claude.ai", "https://claude.ai:8443/cb", true},
+		{"list: loopback accepted", true, "claude.ai", loopback, true},
+		{"list: private-use accepted", true, "claude.ai", privateUse, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var policy *handlerutils.HTTPSRedirectHosts
+			if tc.set {
+				var err error
+				policy, err = handlerutils.ParseHTTPSRedirectHosts(tc.cfg)
+				require.NoError(t, err)
+			}
+			store := newFakeStore()
+			h := NewHandler(store, true, 0, 0, policy)
+			bodyBytes, err := json.Marshal(map[string]any{
+				"redirect_uris":              []string{tc.uri},
+				"client_name":                "Test",
+				"token_endpoint_auth_method": "none",
+			})
+			require.NoError(t, err)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest("POST", "/register", strings.NewReader(string(bodyBytes))))
+			if tc.accepted {
+				require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+				assert.Len(t, store.clients, 1)
+				return
+			}
+			require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+			assert.Contains(t, w.Body.String(), "invalid_redirect_uri")
+			assert.Empty(t, store.clients)
+		})
+	}
 }

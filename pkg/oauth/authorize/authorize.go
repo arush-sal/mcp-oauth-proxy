@@ -24,9 +24,10 @@ type Handler struct {
 	clientID        string
 	clientSecret    string
 	routePrefix     string
+	httpsHosts      *handlerutils.HTTPSRedirectHosts
 }
 
-func NewHandler(db AuthorizationStore, provider providers.Provider, scopesSupported []string, clientID, clientSecret, routePrefix string) http.Handler {
+func NewHandler(db AuthorizationStore, provider providers.Provider, scopesSupported []string, clientID, clientSecret, routePrefix string, httpsHosts *handlerutils.HTTPSRedirectHosts) http.Handler {
 	return &Handler{
 		db:              db,
 		provider:        provider,
@@ -34,6 +35,7 @@ func NewHandler(db AuthorizationStore, provider providers.Provider, scopesSuppor
 		clientID:        clientID,
 		clientSecret:    clientSecret,
 		routePrefix:     routePrefix,
+		httpsHosts:      httpsHosts,
 	}
 }
 
@@ -103,7 +105,10 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !handlerutils.RedirectURIMatches(clientInfo.RedirectUris, authReq.RedirectURI) {
+	// Also enforce DCR_ALLOWED_REDIRECT_HOSTS so clients registered before the
+	// setting was tightened cannot keep an https host that is no longer allowed.
+	if !handlerutils.RedirectURIMatches(clientInfo.RedirectUris, authReq.RedirectURI) ||
+		!p.httpsHosts.AllowsRedirectURI(authReq.RedirectURI) {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 			Error:            "invalid_request",
 			ErrorDescription: "Invalid redirect URI",

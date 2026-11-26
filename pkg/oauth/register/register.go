@@ -171,12 +171,14 @@ type ClientStore interface {
 // 0 means unlimited. ttl, when > 0, stamps each newly registered client with an
 // expiry of issued_at+ttl so it is later rejected at lookup and garbage-collected
 // (M1); 0 means the client never expires.
-func NewHandler(db ClientStore, enabled bool, maxClients int, ttl time.Duration) http.Handler {
+// httpsHosts restricts which https redirect hosts are accepted (nil = any).
+func NewHandler(db ClientStore, enabled bool, maxClients int, ttl time.Duration, httpsHosts *handlerutils.HTTPSRedirectHosts) http.Handler {
 	return &Handler{
 		db:         db,
 		enabled:    enabled,
 		maxClients: maxClients,
 		ttl:        ttl,
+		httpsHosts: httpsHosts,
 	}
 }
 
@@ -185,6 +187,7 @@ type Handler struct {
 	enabled    bool
 	maxClients int
 	ttl        time.Duration
+	httpsHosts *handlerutils.HTTPSRedirectHosts
 }
 
 func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +247,11 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// loopback http are permitted; fragments, embedded credentials and wildcards
 	// are always rejected. Returns invalid_redirect_uri (RFC 7591) with 400.
 	for _, uri := range clientInfo.RedirectUris {
-		if err := validateRedirectURI(uri); err != nil {
+		err := validateRedirectURI(uri)
+		if err == nil && !p.httpsHosts.AllowsRedirectURI(uri) {
+			err = fmt.Errorf("redirect URI %q uses an https host that is not allowed (DCR_ALLOWED_REDIRECT_HOSTS)", uri)
+		}
+		if err != nil {
 			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 				Error:            "invalid_redirect_uri",
 				ErrorDescription: err.Error(),

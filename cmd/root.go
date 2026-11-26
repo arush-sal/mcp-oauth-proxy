@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -93,6 +94,11 @@ type RootCmd struct {
 	// resolves to the finite built-in default.
 	MaxDynamicClients int           `name:"max-dynamic-clients" env:"MAX_DYNAMIC_CLIENTS" usage:"Maximum number of Dynamic Client Registration clients allowed at once. When DCR is enabled, /register rejects new registrations once this many DCR clients exist. 0 means unlimited; the default is finite so the protection is on by default" default:"-1"`
 	DynamicClientTTL  time.Duration `name:"dynamic-client-ttl" env:"DYNAMIC_CLIENT_TTL" usage:"Lifetime of a DCR-registered client (e.g. 720h). When >0, a registered client expires at issued_at+TTL: it is rejected by the authorize/token lookup once expired and is garbage-collected. Default 0 means no expiry; statically provisioned clients are never expired" default:"0"`
+
+	// DCRAllowedRedirectHosts restricts https redirect URI hosts at /register
+	// and /authorize. Unset = any https host (back-compat); "none" or empty =
+	// no https redirects; otherwise a comma-separated exact-host list.
+	DCRAllowedRedirectHosts string `name:"dcr-allowed-redirect-hosts" env:"DCR_ALLOWED_REDIRECT_HOSTS" usage:"Restrict which https redirect URI hosts are accepted at /register and /authorize. Unset (default) allows any https host. 'none' or an empty value rejects every https redirect (loopback http and private-use schemes stay allowed; recommended for CLI/desktop-only deployments). Otherwise a comma-separated list of exact hostnames (e.g. 'claude.ai,chatgpt.com'); matching is case-insensitive on the hostname only (port ignored), with no wildcard or suffix matching"`
 
 	// Trust forwarded headers (follow-up #2). Default true preserves today's
 	// behavior (honors X-Mcp-Oauth-Proxy-URL / X-Forwarded-Proto). When false,
@@ -181,6 +187,12 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 
 		ExternalBaseURL:    c.ExternalBaseURL,
 		XFFTrustedHopCount: c.XFFTrustedHopCount,
+	}
+
+	// An env var that is set but empty (or an explicitly passed empty flag) is
+	// distinct from unset: it means "reject every https redirect".
+	if _, envSet := os.LookupEnv("DCR_ALLOWED_REDIRECT_HOSTS"); envSet || cobraCmd.Flags().Changed("dcr-allowed-redirect-hosts") {
+		config.DCRAllowedRedirectHosts = &c.DCRAllowedRedirectHosts
 	}
 
 	// Validate configuration

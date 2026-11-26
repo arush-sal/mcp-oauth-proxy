@@ -138,6 +138,14 @@ type Config struct {
 	// provisioned clients are never given a TTL regardless of this value.
 	DynamicClientTTL time.Duration
 
+	// DCRAllowedRedirectHosts restricts which https redirect URI hosts are
+	// accepted at /register and /authorize. nil (unset) = any https host
+	// (back-compat). Non-nil: "none" or empty rejects every https redirect URI;
+	// otherwise a comma-separated list of exact hostnames (case-insensitive, no
+	// wildcards; the port is ignored). Loopback http and private-use schemes are
+	// never affected. Validated at startup via handlerutils.ParseHTTPSRedirectHosts.
+	DCRAllowedRedirectHosts *string
+
 	// TrustForwardedHeaders controls whether client-supplied forwarded headers
 	// (X-Mcp-Oauth-Proxy-URL, X-Forwarded-Proto) are trusted when deriving the
 	// external base URL, which feeds redirect URIs, OAuth metadata, and the

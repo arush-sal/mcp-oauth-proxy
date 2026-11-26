@@ -1,6 +1,7 @@
 package handlerutils
 
 import (
+	"fmt"
 	"net/url"
 	"slices"
 	"strings"
@@ -63,4 +64,68 @@ func isLoopbackHost(host string) bool {
 	default:
 		return false
 	}
+}
+
+// HTTPSRedirectHosts restricts which hosts an https redirect URI may use
+// (DCR_ALLOWED_REDIRECT_HOSTS). A nil *HTTPSRedirectHosts is unrestricted (any
+// https host, the back-compat default). A non-nil value with no hosts rejects
+// every https redirect URI. Loopback http and private-use schemes are never
+// affected.
+type HTTPSRedirectHosts struct {
+	hosts map[string]struct{}
+}
+
+// ParseHTTPSRedirectHosts parses the setting value. "none" or an empty value
+// (after trimming) yields a policy that rejects all https redirect URIs.
+// Otherwise the value is a comma-separated list of bare hostnames (no scheme,
+// path, port, wildcard or userinfo); empty entries are ignored and names are
+// lowercased. "none" cannot be combined with hosts.
+func ParseHTTPSRedirectHosts(raw string) (*HTTPSRedirectHosts, error) {
+	p := &HTTPSRedirectHosts{hosts: map[string]struct{}{}}
+	var entries []string
+	for _, e := range strings.Split(raw, ",") {
+		if e = strings.ToLower(strings.TrimSpace(e)); e != "" {
+			entries = append(entries, e)
+		}
+	}
+	if len(entries) == 1 && entries[0] == "none" {
+		return p, nil
+	}
+	for _, e := range entries {
+		if e == "none" || !validHostname(e) {
+			return nil, fmt.Errorf("DCR allowed redirect hosts: invalid entry %q: must be a bare hostname (no scheme, path, port or wildcard); use \"none\" alone to reject all https", e)
+		}
+		p.hosts[e] = struct{}{}
+	}
+	return p, nil
+}
+
+// AllowsRedirectURI reports whether raw is permitted by the policy. Only https
+// URIs are restricted: the hostname (port ignored, case-insensitive) must
+// exactly equal a configured host. Any other scheme returns true.
+func (p *HTTPSRedirectHosts) AllowsRedirectURI(raw string) bool {
+	if p == nil {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if strings.ToLower(u.Scheme) != "https" {
+		return true
+	}
+	_, ok := p.hosts[strings.ToLower(u.Hostname())]
+	return ok
+}
+
+func validHostname(h string) bool {
+	if h == "" || len(h) > 253 || h[0] == '.' || h[len(h)-1] == '.' || h[0] == '-' || h[len(h)-1] == '-' {
+		return false
+	}
+	for _, c := range h {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
 }

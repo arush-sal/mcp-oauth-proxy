@@ -1,6 +1,10 @@
 package handlerutils
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 // TestRedirectURIMatches covers the loopback any-port rule (RFC 8252 section
 // 7.3). The default is an exact string match; only for an http loopback
@@ -136,4 +140,35 @@ func TestRedirectURIMatches(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseHTTPSRedirectHosts(t *testing.T) {
+	ok := []string{"none", "NONE", "", "  ", ",,", "claude.ai", "claude.ai, chatgpt.com ,", "localhost", "a-b.example.com"}
+	for _, in := range ok {
+		_, err := ParseHTTPSRedirectHosts(in)
+		assert.NoError(t, err, "input %q", in)
+	}
+	bad := []string{
+		"https://claude.ai", "claude.ai/path", "*.claude.ai", "*", "claude.ai:443",
+		"[::1]", "user@claude.ai", "none,claude.ai", "claude.ai,none", "bad host",
+		".claude.ai", "claude.ai.", "-a.example", "claude.ai?x", "claude.ai#x",
+	}
+	for _, in := range bad {
+		_, err := ParseHTTPSRedirectHosts(in)
+		assert.Error(t, err, "input %q", in)
+	}
+}
+
+func TestHTTPSRedirectHostsAllowsRedirectURI(t *testing.T) {
+	var unset *HTTPSRedirectHosts
+	assert.True(t, unset.AllowsRedirectURI("https://anything.example/cb"))
+
+	p, err := ParseHTTPSRedirectHosts("claude.ai")
+	assert.NoError(t, err)
+	assert.True(t, p.AllowsRedirectURI("https://claude.ai/cb"))
+	assert.True(t, p.AllowsRedirectURI("HTTPS://CLAUDE.AI:8443/cb"))
+	assert.False(t, p.AllowsRedirectURI("https://evil.claude.ai/cb"))
+	assert.False(t, p.AllowsRedirectURI("https:///cb"))
+	assert.True(t, p.AllowsRedirectURI("http://localhost:1/cb"))
+	assert.True(t, p.AllowsRedirectURI("cursor://x/cb"))
 }

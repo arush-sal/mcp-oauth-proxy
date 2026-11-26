@@ -50,6 +50,7 @@ type OAuthProxy struct {
 	idTokenVerifier callback.IDTokenVerifier
 	forwardCfg      forwardConfig
 	sessionCfg      types.SessionConfig
+	httpsHosts      *handlerutils.HTTPSRedirectHosts
 
 	// Forwarded-header / external-base-URL policy resolved ONCE at startup (H3,
 	// MEDIUM-5), so withCORS injects immutable snapshots into the request context
@@ -135,6 +136,14 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 	// here ensures the proxy can never serve a garbage authoritative base URL.
 	if err := config.ValidateExternalBaseURL(); err != nil {
 		return nil, err
+	}
+
+	var httpsRedirectHosts *handlerutils.HTTPSRedirectHosts
+	if config.DCRAllowedRedirectHosts != nil {
+		var err error
+		if httpsRedirectHosts, err = handlerutils.ParseHTTPSRedirectHosts(*config.DCRAllowedRedirectHosts); err != nil {
+			return nil, err
+		}
 	}
 
 	// Initialize database
@@ -243,6 +252,7 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 	}
 
 	p := &OAuthProxy{
+		httpsHosts:       httpsRedirectHosts,
 		metadata:         metadata,
 		db:               db,
 		rateLimiter:      rateLimiter,
@@ -591,7 +601,7 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	idTokenVerifier := p.buildIDTokenVerifier()
 	p.idTokenVerifier = idTokenVerifier
 
-	authorizeHandler := authorize.NewHandler(p.db, provider, p.metadata.ScopesSupported, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix)
+	authorizeHandler := authorize.NewHandler(p.db, provider, p.metadata.ScopesSupported, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.httpsHosts)
 	tokenHandler := token.NewHandler(p.db, p.authorizer, p.encryptionKey, p.sessionCfg)
 	callbackHandler := callback.NewHandler(p.db, provider, p.encryptionKey, p.GetOAuthClientID(), p.GetOAuthClientSecret(), p.config.RoutePrefix, p.config.CookieNamePrefix, idTokenVerifier, p.authorizer, p.sessionCfg)
 	revokeHandler := revoke.NewHandler(p.db)
@@ -630,7 +640,7 @@ func (p *OAuthProxy) SetupRoutes(mux *http.ServeMux, next http.Handler) {
 	mux.HandleFunc("GET "+prefix+"/callback", p.withCORS(p.withRateLimit(callbackHandler)))
 	mux.HandleFunc("POST "+prefix+"/token", p.withCORS(p.withRateLimit(tokenHandler)))
 	mux.HandleFunc("POST "+prefix+"/revoke", p.withCORS(p.withRateLimit(revokeHandler)))
-	mux.HandleFunc("POST "+prefix+"/register", p.withCORS(p.withRateLimit(register.NewHandler(p.db, p.config.DCREnabled(), p.config.ResolvedMaxDynamicClients(), p.config.DynamicClientTTL))))
+	mux.HandleFunc("POST "+prefix+"/register", p.withCORS(p.withRateLimit(register.NewHandler(p.db, p.config.DCREnabled(), p.config.ResolvedMaxDynamicClients(), p.config.DynamicClientTTL, p.httpsHosts))))
 
 	// Metadata endpoints
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", p.withCORS(p.oauthMetadataHandler))
