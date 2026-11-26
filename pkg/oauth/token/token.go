@@ -167,6 +167,23 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 			})
 			return
 		}
+		// RFC 6749 4.1.3: the token request's redirect_uri must be identical to
+		// the one used at /authorize. Exact byte compare: RedirectURIMatches is
+		// deliberately looser (loopback any-port) and would let a code be
+		// redeemed against a different listener. Legacy grants created before
+		// RedirectURI was persisted have it empty and keep the registration check.
+		//
+		// Omission stays allowed when PKCE is used (checked below): OAuth 2.1
+		// (draft-ietf-oauth-v2-1-17 section 10.2) drops redirect_uri from the token
+		// request because PKCE already prevents code injection, so 2.1-only
+		// clients will not send it. Without PKCE it is still required.
+		if grant.RedirectURI != "" && redirectURI != grant.RedirectURI {
+			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+				Error:            "invalid_grant",
+				ErrorDescription: "redirect_uri does not match the authorization request",
+			})
+			return
+		}
 	}
 
 	// H1 (Fix 2): a public client (no usable secret) must always carry a PKCE

@@ -389,6 +389,9 @@ type Grant struct {
 	ExpiresAt           int64       `gorm:"not null" json:"expires_at"`
 	CodeChallenge       string      `json:"code_challenge,omitempty"`
 	CodeChallengeMethod string      `json:"code_challenge_method,omitempty"`
+	// RedirectURI is the redirect_uri sent to /authorize; /token must match it
+	// exactly (RFC 6749 4.1.3). Empty for grants created before this column existed.
+	RedirectURI string `gorm:"not null;default:''" json:"redirect_uri,omitempty"`
 }
 
 // AuthorizationCode represents an authorization code

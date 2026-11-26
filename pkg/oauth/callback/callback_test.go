@@ -720,3 +720,22 @@ func TestCallback_TokenDBExpiryReflectsCustomConfig(t *testing.T) {
 	require.NotNil(t, store.storedGrant)
 	assert.Equal(t, int64((48 * time.Hour).Seconds()), store.storedGrant.ExpiresAt-store.storedGrant.CreatedAt)
 }
+
+// TestCallback_StoresRedirectURIOnGrant: the authorize-time redirect_uri must be
+// persisted on the grant so /token can bind to it (RFC 6749 4.1.3).
+func TestCallback_StoresRedirectURIOnGrant(t *testing.T) {
+	store := &fakeStore{authRequest: map[string]any{
+		"client_id":    "client",
+		"scope":        "openid email",
+		"redirect_uri": "http://127.0.0.1:5000/cb",
+	}}
+	provider := &fakeProvider{token: &oauth2.Token{AccessToken: "at", Expiry: time.Now().Add(time.Hour)}}
+	h := NewHandler(store, provider, testEncryptionKey, "client", "secret", "", "", nil, allowAny(t), defaultSession())
+
+	rec, req := newCallbackRequest(t)
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusFound, rec.Code, "body: %s", rec.Body.String())
+	require.NotNil(t, store.storedGrant)
+	assert.Equal(t, "http://127.0.0.1:5000/cb", store.storedGrant.RedirectURI)
+}

@@ -135,6 +135,7 @@ func testGrantOperations(t *testing.T, db *Store) {
 		ExpiresAt:           time.Now().Add(10 * time.Minute).Unix(),
 		CodeChallenge:       "test_challenge",
 		CodeChallengeMethod: "S256",
+		RedirectURI:         "http://127.0.0.1:5000/cb",
 	}
 
 	err = db.StoreGrant(grant)
@@ -153,6 +154,7 @@ func testGrantOperations(t *testing.T, db *Store) {
 	assert.Equal(t, grant.ExpiresAt, retrievedGrant.ExpiresAt)
 	assert.Equal(t, grant.CodeChallenge, retrievedGrant.CodeChallenge)
 	assert.Equal(t, grant.CodeChallengeMethod, retrievedGrant.CodeChallengeMethod)
+	assert.Equal(t, grant.RedirectURI, retrievedGrant.RedirectURI)
 
 	// Test retrieving non-existent grant
 	_, err = db.GetGrant("non_existent_grant", "test_user_123")

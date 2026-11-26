@@ -390,6 +390,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:           now + int64(p.session.RefreshTTL.Seconds()), // grant expiry mirrors the refresh token lifetime
 		CodeChallenge:       authReq.CodeChallenge,
 		CodeChallengeMethod: authReq.CodeChallengeMethod,
+		RedirectURI:         authReq.RedirectURI,
 	}
 
 	// Store the grant

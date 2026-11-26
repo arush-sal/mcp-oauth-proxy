@@ -577,3 +577,66 @@ func TestRefreshTokenGrant_TTLHonorsCustomConfig(t *testing.T) {
 	assert.InDelta(t, (45 * time.Minute).Seconds(), time.Until(newTok.ExpiresAt).Seconds(), 30)
 	assert.InDelta(t, (10 * time.Hour).Seconds(), time.Until(newTok.RefreshTokenExpiresAt).Seconds(), 30)
 }
+
+// TestAuthorizationCodeGrant_RedirectURIBoundToAuthorizeRequest covers RFC 6749
+// 4.1.3: a redirect_uri sent to /token must be identical to the one used at
+// /authorize (stored on the grant), not merely any registered or
+// loopback-port-equivalent URI. Failed checks must not consume the code.
+func TestAuthorizationCodeGrant_RedirectURIBoundToAuthorizeRequest(t *testing.T) {
+	const bound = "http://127.0.0.1:5000/cb"
+	tests := []struct {
+		name         string
+		grantURI     string // grant.RedirectURI ("" = legacy grant)
+		sent         string // form redirect_uri ("" = omitted)
+		confidential bool   // confidential client without PKCE
+		wantOK       bool
+	}{
+		{name: "identical URI succeeds", grantURI: bound, sent: bound, wantOK: true},
+		{name: "different loopback port fails", grantURI: bound, sent: "http://127.0.0.1:6000/cb"},
+		{name: "different registered URI fails", grantURI: bound, sent: "https://app.example/cb"},
+		{name: "case-different scheme fails", grantURI: bound, sent: "HTTP://127.0.0.1:5000/cb"},
+		{name: "omitted with PKCE succeeds (OAuth 2.1 10.2)", grantURI: bound, sent: "", wantOK: true},
+		{name: "omitted without PKCE fails", grantURI: bound, sent: "", confidential: true},
+		{name: "legacy grant accepts any registered URI", grantURI: "", sent: "https://app.example/cb", wantOK: true},
+		{name: "legacy grant accepts loopback port variant", grantURI: "", sent: "http://127.0.0.1:6000/cb", wantOK: true},
+		{name: "unregistered URI still fails", grantURI: "https://evil.example/cb", sent: "https://evil.example/cb"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := authCodeStore(t)
+			store.client.RedirectUris = []string{bound, "https://app.example/cb"}
+			store.grant.RedirectURI = tc.grantURI
+
+			form := url.Values{}
+			form.Set("grant_type", "authorization_code")
+			form.Set("code", "the-code")
+			form.Set("client_id", "client")
+			if tc.confidential {
+				store.client.TokenEndpointAuthMethod = "client_secret_post"
+				store.client.ClientSecret = "the-secret"
+				store.grant.CodeChallenge = ""
+				store.grant.CodeChallengeMethod = ""
+				form.Set("client_secret", "the-secret")
+			} else {
+				form.Set("code_verifier", "the-verifier")
+			}
+			if tc.sent != "" {
+				form.Set("redirect_uri", tc.sent)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+			rec := httptest.NewRecorder()
+			NewHandler(store, nil, make([]byte, 32), defaultSession()).ServeHTTP(rec, req)
+
+			if tc.wantOK {
+				require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+				assert.True(t, store.codeConsumed)
+				return
+			}
+			assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+			assert.Empty(t, store.stored, "no tokens may be issued")
+			assert.False(t, store.codeConsumed, "a rejected exchange must not consume the code")
+		})
+	}
+}

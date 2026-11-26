@@ -149,6 +149,7 @@ func (d *Store) StoreGrant(grant *types.Grant) error {
 		ExpiresAt:           grant.ExpiresAt,
 		CodeChallenge:       grant.CodeChallenge,
 		CodeChallengeMethod: grant.CodeChallengeMethod,
+		RedirectURI:         grant.RedirectURI,
 	}
 	return d.db.Create(gormGrant).Error
 }
@@ -195,6 +196,7 @@ func (d *Store) GetGrant(grantID, userID string) (*types.Grant, error) {
 		ExpiresAt:           grant.ExpiresAt,
 		CodeChallenge:       grant.CodeChallenge,
 		CodeChallengeMethod: grant.CodeChallengeMethod,
+		RedirectURI:         grant.RedirectURI,
 	}
 
 	return result, nil
