@@ -234,7 +234,7 @@ The proxy always deletes any inbound `Authorization` header and sets the `X-Forw
 | -------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
 | `AUTHORIZATION_HEADER_TOKEN`     | ❌       | Token to place on the upstream `Authorization` header: `none` (default), `access_token`, or `id_token`        |
 | `ID_TOKEN_HEADER`                | ❌       | Custom header to carry the raw verified `id_token` (no `Bearer ` prefix). When empty and forwarding the id_token, `Authorization: Bearer <id_token>` is used |
-| `STRIP_INBOUND_IDENTITY_HEADERS` | ❌       | When `true`, strip client-supplied identity headers (`X-Forwarded-*`, `X-Auth-Request-*`, `X-Remote-*`, the configured `ID_TOKEN_HEADER`) before forwarding, so a caller cannot spoof identity. Default `false` |
+| `STRIP_INBOUND_IDENTITY_HEADERS` | ❌       | When `true`, strip client-supplied identity headers (`X-Forwarded-*`, `X-Auth-Request-*`, `X-Remote-*`, the configured `ID_TOKEN_HEADER`) before forwarding, so a caller cannot spoof identity. Default `false`. **Recommended `true`** whenever an upstream trusts `X-Remote-*`, `X-Forwarded-Groups`, `X-Auth-Request-*` or similar headers: with `false`, client-supplied values for them are forwarded. Headers the proxy does not own (e.g. `True-Client-IP`, `CF-Connecting-IP`, `X-Forwarded-Ssl`, `X-Original-Host`, `X-Http-Method-Override`) always pass through, so upstreams must not trust them |
 
 Colliding configurations are rejected at startup (e.g. routing two tokens to the same header). A stale/expired `id_token` is never forwarded. Forwarding the `id_token` is useful for upstreams that validate JWTs themselves (e.g. Grafana `[auth.jwt]`).
 

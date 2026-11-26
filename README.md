@@ -557,6 +557,19 @@ the proxy is authoritative for them regardless of this setting: it sets
 `X-Rewrite-URL`, `X-Original-URI`, `X-Forwarded-Path` and
 `X-Envoy-Original-Path`.
 
+**Headers the proxy does not own pass through unchanged.** Any other
+client-supplied header reaches the upstream as sent. That includes
+client-IP headers (`True-Client-IP`, `CF-Connecting-IP`, `X-Client-IP`,
+`X-Cluster-Client-IP`), scheme/host headers (`X-Forwarded-Server`,
+`X-Forwarded-Ssl`, `X-Forwarded-Scheme`, `Front-End-Https`, `X-Url-Scheme`,
+`X-Original-Host`, `X-Host`) and `X-Http-Method-Override`. Upstreams must not
+use these for authorization, client-IP, scheme or routing decisions behind this
+proxy; rely on the proxy-managed headers above instead. If an upstream trusts
+`X-Remote-*`, `X-Forwarded-Groups`, `X-Auth-Request-*` or similar identity
+headers, set `STRIP_INBOUND_IDENTITY_HEADERS=true` (recommended for most
+deployments), because with the default `false` client-supplied values for those
+headers are forwarded.
+
 In **proxy** mode the strip is applied to the outbound request the proxy makes
 to the upstream, so a spoofed client header cannot reach the upstream. In
 **forward-auth** mode the proxy only controls the headers it writes onto its own
