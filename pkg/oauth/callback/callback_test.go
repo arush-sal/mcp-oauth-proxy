@@ -25,6 +25,7 @@ type fakeStore struct {
 	authRequest map[string]any
 	storedGrant *types.Grant
 	storedToken *types.TokenData
+	deleted     bool
 }
 
 func (s *fakeStore) StoreGrant(grant *types.Grant) error {
@@ -35,7 +36,7 @@ func (s *fakeStore) StoreAuthCode(string, string, string) error { return nil }
 func (s *fakeStore) GetAuthRequest(string) (map[string]any, error) {
 	return s.authRequest, nil
 }
-func (s *fakeStore) DeleteAuthRequest(string) error { return nil }
+func (s *fakeStore) DeleteAuthRequest(string) error { s.deleted = true; return nil }
 func (s *fakeStore) StoreToken(td *types.TokenData) error {
 	s.storedToken = td
 	return nil
@@ -43,8 +44,9 @@ func (s *fakeStore) StoreToken(td *types.TokenData) error {
 
 // fakeProvider returns a fixed token from ExchangeCodeForToken.
 type fakeProvider struct {
-	token    *oauth2.Token
-	userInfo *providers.UserInfo
+	token     *oauth2.Token
+	userInfo  *providers.UserInfo
+	exchanged bool
 }
 
 func (p *fakeProvider) GetAuthorizationURL(string, string, string, string) string { return "" }
@@ -52,6 +54,7 @@ func (p *fakeProvider) GetAuthorizationURLWithPKCE(string, string, string, strin
 	return ""
 }
 func (p *fakeProvider) ExchangeCodeForToken(context.Context, string, string, string, string) (*oauth2.Token, error) {
+	p.exchanged = true
 	return p.token, nil
 }
 func (p *fakeProvider) GetUserInfo(context.Context, string) (*providers.UserInfo, error) {
@@ -773,6 +776,8 @@ func TestCallback_HTTPSRedirectHostPolicy(t *testing.T) {
 			assert.Equal(t, http.StatusBadRequest, rec.Code)
 			assert.Contains(t, rec.Body.String(), "invalid_request")
 			assert.Nil(t, store.storedGrant)
+			assert.False(t, provider.exchanged, "code must not be exchanged on rejection")
+			assert.False(t, store.deleted, "auth request must not be deleted on rejection")
 		})
 	}
 }

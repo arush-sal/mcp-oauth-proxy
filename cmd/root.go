@@ -142,54 +142,7 @@ func (c *RootCmd) Run(cobraCmd *cobra.Command, args []string) error {
 		log.Println("Verbose logging enabled")
 	}
 
-	// Convert CLI config to internal config format
-	config := &types.Config{
-		DatabaseDSN:       c.DatabaseDSN,
-		OAuthClientID:     c.OAuthClientID,
-		OAuthClientSecret: c.OAuthClientSecret,
-		OAuthAuthorizeURL: c.OAuthAuthorizeURL,
-		OAuthJWKSURL:      c.OAuthJWKSURL,
-		OAuthIssuerURL:    c.OAuthIssuerURL,
-		ScopesSupported:   c.ScopesSupported,
-		MCPServerURL:      c.MCPServerURL,
-		EncryptionKey:     c.EncryptionKey,
-		Mode:              c.Mode,
-		RoutePrefix:       c.RoutePrefix,
-
-		AllowedEmails:              parseCommaList(c.AllowedEmails),
-		AllowedEmailsFile:          c.AllowedEmailsFile,
-		AllowedEmailDomains:        parseCommaList(c.AllowedEmailDomains),
-		AllowedGroups:              parseCommaList(c.AllowedGroups),
-		GroupsClaim:                c.GroupsClaim,
-		AllowedGoogleHostedDomains: parseCommaList(c.AllowedGoogleHostedDomains),
-
-		AuthorizationHeaderToken: c.AuthorizationHeaderToken,
-		IDTokenHeader:            c.IDTokenHeader,
-
-		StripInboundIdentityHeaders: c.StripInboundIdentityHeaders,
-
-		CookieExpire:   c.CookieExpire,
-		CookieRefresh:  c.CookieRefresh,
-		CookieSecure:   c.CookieSecure,
-		CookieSameSite: c.CookieSameSite,
-
-		HealthPath:     c.HealthPath,
-		ReadyPath:      c.ReadyPath,
-		EnableMetrics:  c.EnableMetrics,
-		MetricsPath:    c.MetricsPath,
-		MetricsAddress: c.MetricsAddress,
-
-		EnableDynamicClientRegistration: &c.EnableDynamicClientRegistration,
-		MaxDynamicClients:               c.MaxDynamicClients,
-		DynamicClientTTL:                c.DynamicClientTTL,
-
-		TrustForwardedHeaders: &c.TrustForwardedHeaders,
-
-		ExternalBaseURL:    c.ExternalBaseURL,
-		XFFTrustedHopCount: c.XFFTrustedHopCount,
-	}
-
-	config.DCRAllowedRedirectHosts = c.dcrAllowedRedirectHosts(cobraCmd)
+	config := c.buildConfig(cobraCmd)
 
 	// Validate configuration
 	if err := c.validateConfig(); err != nil {
@@ -293,6 +246,58 @@ func (c *RootCmd) shutdownMetricsCtx(ctx context.Context, metricsServer *http.Se
 	if err := metricsServer.Shutdown(ctx); err != nil {
 		log.Printf("Metrics server shutdown error: %v", err)
 	}
+}
+
+// buildConfig converts the CLI config to the internal config format.
+func (c *RootCmd) buildConfig(cobraCmd *cobra.Command) *types.Config {
+	config := &types.Config{
+		DatabaseDSN:       c.DatabaseDSN,
+		OAuthClientID:     c.OAuthClientID,
+		OAuthClientSecret: c.OAuthClientSecret,
+		OAuthAuthorizeURL: c.OAuthAuthorizeURL,
+		OAuthJWKSURL:      c.OAuthJWKSURL,
+		OAuthIssuerURL:    c.OAuthIssuerURL,
+		ScopesSupported:   c.ScopesSupported,
+		MCPServerURL:      c.MCPServerURL,
+		EncryptionKey:     c.EncryptionKey,
+		Mode:              c.Mode,
+		RoutePrefix:       c.RoutePrefix,
+
+		AllowedEmails:              parseCommaList(c.AllowedEmails),
+		AllowedEmailsFile:          c.AllowedEmailsFile,
+		AllowedEmailDomains:        parseCommaList(c.AllowedEmailDomains),
+		AllowedGroups:              parseCommaList(c.AllowedGroups),
+		GroupsClaim:                c.GroupsClaim,
+		AllowedGoogleHostedDomains: parseCommaList(c.AllowedGoogleHostedDomains),
+
+		AuthorizationHeaderToken: c.AuthorizationHeaderToken,
+		IDTokenHeader:            c.IDTokenHeader,
+
+		StripInboundIdentityHeaders: c.StripInboundIdentityHeaders,
+
+		CookieExpire:   c.CookieExpire,
+		CookieRefresh:  c.CookieRefresh,
+		CookieSecure:   c.CookieSecure,
+		CookieSameSite: c.CookieSameSite,
+
+		HealthPath:     c.HealthPath,
+		ReadyPath:      c.ReadyPath,
+		EnableMetrics:  c.EnableMetrics,
+		MetricsPath:    c.MetricsPath,
+		MetricsAddress: c.MetricsAddress,
+
+		EnableDynamicClientRegistration: &c.EnableDynamicClientRegistration,
+		MaxDynamicClients:               c.MaxDynamicClients,
+		DynamicClientTTL:                c.DynamicClientTTL,
+
+		TrustForwardedHeaders: &c.TrustForwardedHeaders,
+
+		ExternalBaseURL:    c.ExternalBaseURL,
+		XFFTrustedHopCount: c.XFFTrustedHopCount,
+	}
+
+	config.DCRAllowedRedirectHosts = c.dcrAllowedRedirectHosts(cobraCmd)
+	return config
 }
 
 // dcrAllowedRedirectHosts returns nil when DCR_ALLOWED_REDIRECT_HOSTS /

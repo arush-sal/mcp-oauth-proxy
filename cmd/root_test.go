@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"testing"
 
 	"github.com/gptscript-ai/cmd"
@@ -22,14 +23,14 @@ func resolveDCRHosts(t *testing.T, args ...string) *string {
 }
 
 // probeCmd reuses RootCmd's flag/env binding but replaces Run so no server
-// starts.
+// starts. It reads the value through buildConfig, the same path Run uses.
 type probeCmd struct {
 	RootCmd
 	got *string
 }
 
 func (p *probeCmd) Run(c *cobra.Command, _ []string) error {
-	p.got = p.RootCmd.dcrAllowedRedirectHosts(c)
+	p.got = p.RootCmd.buildConfig(c).DCRAllowedRedirectHosts
 	return nil
 }
 
@@ -50,6 +51,11 @@ func TestDCRAllowedRedirectHostsWiring(t *testing.T) {
 	}
 
 	t.Run("unset is unrestricted", func(t *testing.T) {
+		// Make sure ambient env cannot leak in; restore it afterwards.
+		if old, ok := os.LookupEnv("DCR_ALLOWED_REDIRECT_HOSTS"); ok {
+			t.Cleanup(func() { _ = os.Setenv("DCR_ALLOWED_REDIRECT_HOSTS", old) })
+		}
+		require.NoError(t, os.Unsetenv("DCR_ALLOWED_REDIRECT_HOSTS"))
 		got := resolveDCRHosts(t)
 		require.Nil(t, got)
 		assert.True(t, policyFor(t, got).AllowsRedirectURI(disallowed))
@@ -72,6 +78,13 @@ func TestDCRAllowedRedirectHostsWiring(t *testing.T) {
 		p := policyFor(t, resolveDCRHosts(t, "--dcr-allowed-redirect-hosts="))
 		require.NotNil(t, p)
 		assert.False(t, p.AllowsRedirectURI(allowed))
+	})
+	t.Run("flag takes precedence over env", func(t *testing.T) {
+		t.Setenv("DCR_ALLOWED_REDIRECT_HOSTS", "attacker.example")
+		p := policyFor(t, resolveDCRHosts(t, "--dcr-allowed-redirect-hosts=claude.ai"))
+		require.NotNil(t, p)
+		assert.True(t, p.AllowsRedirectURI(allowed))
+		assert.False(t, p.AllowsRedirectURI(disallowed))
 	})
 	t.Run("flag list", func(t *testing.T) {
 		p := policyFor(t, resolveDCRHosts(t, "--dcr-allowed-redirect-hosts=claude.ai"))
