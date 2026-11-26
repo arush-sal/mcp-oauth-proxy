@@ -208,26 +208,11 @@ func JSON(w http.ResponseWriter, statusCode int, obj any) {
 // rotation vector. Operators behind a trusted LB should set N to their hop count
 // (1 for a single ALB) to get a correct, non-spoofable per-client key.
 func GetClientIP(r *http.Request) string {
-	if trustForwardedFromContext(r.Context()) {
-		if n := xffTrustedHopCountFromContext(r.Context()); n > 0 {
-			// Materialize ALL X-Forwarded-For field lines in order before
-			// splitting (HIGH-2): a client can send its own line and a trusted LB
-			// can APPEND a separate line, and Header.Get would see only the first
-			// (client) line. Joining the values preserves the appended order so
-			// the rightmost entry is the closest trusted proxy's contribution.
-			if lines := r.Header.Values("X-Forwarded-For"); len(lines) > 0 {
-				parts := strings.Split(strings.Join(lines, ","), ",")
-				if n <= len(parts) {
-					// Parse the selected entry safely (MEDIUM-3). Empty/garbage
-					// entries fall through to the RemoteAddr fallback so the key is
-					// always a valid IP.
-					if ip, ok := parseIPCandidate(parts[len(parts)-n]); ok {
-						return ip
-					}
-				}
-				// N exceeds the number of entries, or the selected entry is not a
-				// valid IP: fail safe to RemoteAddr.
-			}
+	if parts, i, ok := trustedXFFEntries(r); ok {
+		// Parse the selected entry safely (MEDIUM-3). Empty/garbage entries fall
+		// through to the RemoteAddr fallback so the key is always a valid IP.
+		if ip, ok := parseIPCandidate(parts[i]); ok {
+			return ip
 		}
 	}
 
@@ -242,6 +227,56 @@ func GetClientIP(r *http.Request) string {
 	// collapses to one shared key and cannot be used to mint distinct spoofed
 	// keys.
 	return unknownClientIP
+}
+
+// trustedXFFEntries returns the X-Forwarded-For entries and the index of the
+// hop-count-selected client IP, or ok=false when forwarded headers are not
+// trusted, the hop count is 0, or the chain is shorter than the hop count. It
+// is the single selection shared by GetClientIP and TrustedXFFChain.
+func trustedXFFEntries(r *http.Request) (parts []string, i int, ok bool) {
+	if !trustForwardedFromContext(r.Context()) {
+		return nil, 0, false
+	}
+	n := xffTrustedHopCountFromContext(r.Context())
+	if n <= 0 {
+		return nil, 0, false
+	}
+	// Materialize ALL X-Forwarded-For field lines in order before splitting
+	// (HIGH-2): a client can send its own line and a trusted LB can APPEND a
+	// separate line, and Header.Get would see only the first (client) line.
+	// Joining the values preserves the appended order so the rightmost entry is
+	// the closest trusted proxy's contribution.
+	lines := r.Header.Values("X-Forwarded-For")
+	if len(lines) == 0 {
+		return nil, 0, false
+	}
+	parts = strings.Split(strings.Join(lines, ","), ",")
+	if n > len(parts) {
+		return nil, 0, false
+	}
+	return parts, len(parts) - n, true
+}
+
+// TrustedXFFChain returns the trusted suffix of the X-Forwarded-For chain: the
+// client IP selected exactly as GetClientIP selects it, through the rightmost
+// entry, each normalized by parseIPCandidate. Entries left of the selected one
+// are client-spoofable and are never returned. It returns nil (fail closed)
+// when no entry is trusted (see trustedXFFEntries) or when any returned entry
+// is not a valid IP. The reverse proxy forwards this suffix upstream.
+func TrustedXFFChain(r *http.Request) []string {
+	parts, i, ok := trustedXFFEntries(r)
+	if !ok {
+		return nil
+	}
+	chain := make([]string, 0, len(parts)-i)
+	for _, p := range parts[i:] {
+		ip, ok := parseIPCandidate(p)
+		if !ok {
+			return nil
+		}
+		chain = append(chain, ip)
+	}
+	return chain
 }
 
 // parseIPCandidate normalizes a single client-IP candidate (an X-Forwarded-For

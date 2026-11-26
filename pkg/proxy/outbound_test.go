@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,15 +102,15 @@ func TestProxyOutboundRequestPinned(t *testing.T) {
 	assert.Equal(t, "/mcp/a%2Fb/c?x=1&x=2&y=two+words", got.requestURI)
 	assert.Equal(t, "/mcp/a/b/c", got.path)
 
-	// Forwarded headers (trusted by default): XFF keeps the client's chain and
-	// appends the peer IP; X-Forwarded-Host is the external host (a spoofed
-	// value is overwritten); X-Forwarded-Proto is never empty; Forwarded and
-	// X-Forwarded-Uri pass through.
-	assert.Equal(t, []string{"203.0.113.9, 127.0.0.1"}, got.header["X-Forwarded-For"])
+	// Forwarded headers (trusted by default, hop count 0): no client XFF entry
+	// is trusted, so XFF is just the peer IP; X-Forwarded-Host is the external
+	// host (a spoofed value is overwritten); X-Forwarded-Proto is never empty;
+	// the client's Forwarded and X-Forwarded-Uri never reach the upstream.
+	assert.Equal(t, []string{"127.0.0.1"}, got.header["X-Forwarded-For"])
 	assert.Equal(t, []string{"proxy.example.com"}, got.header["X-Forwarded-Host"])
 	assert.Equal(t, []string{"http"}, got.header["X-Forwarded-Proto"])
-	assert.Equal(t, []string{"for=198.51.100.1"}, got.header["Forwarded"])
-	assert.Equal(t, "/client/uri", got.header.Get("X-Forwarded-Uri"))
+	assert.NotContains(t, got.header, "Forwarded")
+	assert.NotContains(t, got.header, "X-Forwarded-Uri")
 
 	// Proxy-managed identity headers are re-derived from the grant, never the
 	// spoofed inbound values; inbound Authorization is dropped (policy none).
@@ -172,40 +173,74 @@ func TestProxyOutboundForwardedProto(t *testing.T) {
 	}
 }
 
-// TestProxyOutboundForwardedChainTrust: the client's X-Forwarded-For chain and
-// Forwarded header are carried only when forwarded headers are trusted; when
-// untrusted, X-Forwarded-For is just the peer IP and Forwarded is absent.
+// TestProxyOutboundForwardedChainTrust: upstream X-Forwarded-For is the
+// hop-count-selected client IP through the rightmost entry (the same selection
+// as the rate-limit client IP) plus the peer IP. Spoofable entries left of the
+// selected one are dropped; untrusted mode, hop count 0, a malformed or short
+// chain, or a Connection-nominated XFF all fail closed to the peer IP alone.
+// The inbound Forwarded header is always dropped.
 func TestProxyOutboundForwardedChainTrust(t *testing.T) {
-	seed := func(r *http.Request) {
-		r.Header.Set("X-Forwarded-For", "203.0.113.9")
-		r.Header.Set("Forwarded", "for=198.51.100.1")
+	seed := func(lines ...string) func(*http.Request) {
+		return func(r *http.Request) {
+			for _, l := range lines {
+				r.Header.Add("X-Forwarded-For", l)
+			}
+			r.Header.Set("Forwarded", "for=198.51.100.1")
+		}
 	}
+	hops := func(n int) *types.Config { return &types.Config{XFFTrustedHopCount: n} }
 
-	t.Run("trusted", func(t *testing.T) {
-		got, _ := proxyThroughHandler(t, &types.Config{}, stripProps(), false, seed)
-		assert.Equal(t, []string{"203.0.113.9, 127.0.0.1"}, got.header["X-Forwarded-For"])
-		assert.Equal(t, []string{"for=198.51.100.1"}, got.header["Forwarded"])
-	})
-	t.Run("untrusted", func(t *testing.T) {
-		got, _ := proxyThroughHandler(t, &types.Config{TrustForwardedHeaders: untrusted()}, stripProps(), false, seed)
-		assert.Equal(t, []string{"127.0.0.1"}, got.header["X-Forwarded-For"])
-		assert.NotContains(t, got.header, "Forwarded")
-	})
-	t.Run("no client headers", func(t *testing.T) {
-		got, _ := proxyThroughHandler(t, &types.Config{}, stripProps(), false, nil)
-		assert.Equal(t, []string{"127.0.0.1"}, got.header["X-Forwarded-For"])
-		assert.NotContains(t, got.header, "Forwarded")
-	})
-	t.Run("connection-nominated", func(t *testing.T) {
-		// A client naming them as hop-by-hop (RFC 9110 7.6.1) means they are
-		// not carried even when trusted.
-		got, _ := proxyThroughHandler(t, &types.Config{}, stripProps(), false, func(r *http.Request) {
-			seed(r)
+	cases := []struct {
+		name  string
+		cfg   *types.Config
+		build func(*http.Request)
+		want  string
+	}{
+		{name: "trusted, hop count 0", cfg: hops(0), build: seed("203.0.113.9"), want: "127.0.0.1"},
+		{name: "trusted, 1 hop drops spoofed left", cfg: hops(1), build: seed("192.0.2.66, 203.0.113.9"), want: "203.0.113.9, 127.0.0.1"},
+		{name: "trusted, 2 hops", cfg: hops(2), build: seed("192.0.2.66, 198.51.100.5, 203.0.113.10"), want: "198.51.100.5, 203.0.113.10, 127.0.0.1"},
+		{name: "trusted, duplicate fields", cfg: hops(2), build: seed("192.0.2.66, 198.51.100.5", "203.0.113.10"), want: "198.51.100.5, 203.0.113.10, 127.0.0.1"},
+		{name: "trusted, shorter than hop count", cfg: hops(3), build: seed("198.51.100.5, 203.0.113.10"), want: "127.0.0.1"},
+		{name: "trusted, malformed", cfg: hops(1), build: seed("192.0.2.66, not-an-ip"), want: "127.0.0.1"},
+		{name: "untrusted", cfg: &types.Config{TrustForwardedHeaders: untrusted(), XFFTrustedHopCount: 1}, build: seed("192.0.2.66, 203.0.113.9"), want: "127.0.0.1"},
+		{name: "no client headers", cfg: hops(1), want: "127.0.0.1"},
+		{name: "connection-nominated", cfg: hops(1), build: func(r *http.Request) {
+			seed("192.0.2.66, 203.0.113.9")(r)
 			r.Header.Set("Connection", "forwarded, x-forwarded-for")
+		}, want: "127.0.0.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, _ := proxyThroughHandler(t, tc.cfg, stripProps(), false, tc.build)
+			assert.Equal(t, []string{tc.want}, got.header["X-Forwarded-For"])
+			assert.NotContains(t, got.header, "Forwarded")
 		})
-		assert.Equal(t, []string{"127.0.0.1"}, got.header["X-Forwarded-For"])
-		assert.NotContains(t, got.header, "Forwarded")
-	})
+	}
+}
+
+// pathOverrideHeaders are request-path override headers some upstream
+// frameworks and gateways honor in place of the request line.
+var pathOverrideHeaders = []string{"X-Original-Url", "X-Rewrite-Url", "X-Original-Uri", "X-Forwarded-Path", "X-Envoy-Original-Path"}
+
+// TestProxyOutboundDropsClientForwardingHeaders: forwarding and path-override
+// headers the proxy does not own (X-Forwarded-Uri, X-Real-Ip,
+// X-Forwarded-Port, X-Forwarded-Prefix, pathOverrideHeaders) are never passed
+// through from the client, in either trust mode.
+func TestProxyOutboundDropsClientForwardingHeaders(t *testing.T) {
+	for _, cfg := range []*types.Config{{XFFTrustedHopCount: 1}, {TrustForwardedHeaders: untrusted(), XFFTrustedHopCount: 1}} {
+		got, _ := proxyThroughHandler(t, cfg, stripProps(), false, func(r *http.Request) {
+			r.Header.Set("X-Forwarded-Uri", "/admin")
+			r.Header.Set("X-Real-Ip", "192.0.2.66")
+			r.Header.Set("X-Forwarded-Port", "8443")
+			r.Header.Set("X-Forwarded-Prefix", "/evil")
+			for _, h := range pathOverrideHeaders {
+				r.Header.Set(h, "/admin")
+			}
+		})
+		for _, h := range append([]string{"X-Forwarded-Uri", "X-Real-Ip", "X-Forwarded-Port", "X-Forwarded-Prefix"}, pathOverrideHeaders...) {
+			assert.NotContains(t, got.header, h, "trust=%v", cfg.TrustForwardedHeadersEnabled())
+		}
+	}
 }
 
 // TestProxyOutboundSpoofedIdentityMissingProps: with no identity in the grant,
@@ -263,4 +298,27 @@ func TestProxyOutboundConnectionCannotDropProxyHeaders(t *testing.T) {
 	assert.Equal(t, []string{"proxy.example.com"}, got.header["X-Forwarded-Host"])
 	assert.Equal(t, []string{"Bearer access-abc"}, got.header["Authorization"])
 	assert.Equal(t, "http://proxy.example.com/next?step=2", resp.Header.Get("Location"))
+}
+
+// TestTrustForwardedWithoutExternalBaseURLWarns: trusting forwarded headers
+// without an external base URL lets a direct client steer the external origin,
+// so startup warns; it stays quiet when an external base URL is set or trust is
+// off.
+func TestTrustForwardedWithoutExternalBaseURLWarns(t *testing.T) {
+	const marker = "WARNING: TRUST_FORWARDED_HEADERS is enabled without EXTERNAL_BASE_URL"
+	cases := []struct {
+		name string
+		cfg  *types.Config
+		want bool
+	}{
+		{name: "trusted, no external base url", cfg: &types.Config{}, want: true},
+		{name: "trusted, external base url", cfg: &types.Config{ExternalBaseURL: "https://auth.example.com"}},
+		{name: "untrusted", cfg: &types.Config{TrustForwardedHeaders: untrusted()}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := captureLog(func() { newForwardProxy(t, tc.cfg) })
+			assert.Equal(t, tc.want, strings.Contains(out, marker), out)
+		})
+	}
 }

@@ -263,6 +263,11 @@ func NewOAuthProxy(config *types.Config) (*OAuthProxy, error) {
 		externalBaseURL:  config.NormalizedExternalBaseURL(),
 		xffHopCount:      config.XFFTrustedHopCount,
 	}
+	if p.trustForwarded && p.externalBaseURL == "" {
+		log.Println("WARNING: TRUST_FORWARDED_HEADERS is enabled without EXTERNAL_BASE_URL: a client that can reach this proxy directly can steer the external base URL " +
+			"(OAuth redirect URIs and metadata), the upstream X-Forwarded-Host and the rewritten Location host via X-Mcp-Oauth-Proxy-URL / X-Forwarded-Proto. " +
+			"Only trust forwarded headers behind an edge proxy that overwrites them, and set EXTERNAL_BASE_URL.")
+	}
 	// Default the readiness check to a real DB ping; tests may override it.
 	p.readinessPing = p.db.Ping
 	return p, nil
@@ -893,13 +898,16 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 		// metadata: the external base URL wins when configured, and forwarded
 		// headers are honored only under the trust policy. It feeds
 		// X-Forwarded-Host/-Proto and the Location rewrite below.
-		extScheme := "http"
-		if handlerutils.RequestIsHTTPS(r) {
-			extScheme = "https"
-		}
-		extHost := r.Host
-		if u, err := url.Parse(handlerutils.GetBaseURL(r)); err == nil && u.Host != "" {
-			extHost = u.Host
+		// Both come from ONE GetBaseURL result so they cannot drift; its scheme
+		// matches RequestIsHTTPS by construction.
+		extScheme, extHost := "http", r.Host
+		if u, err := url.Parse(handlerutils.GetBaseURL(r)); err == nil {
+			if u.Scheme == "https" {
+				extScheme = "https"
+			}
+			if u.Host != "" {
+				extHost = u.Host
+			}
 		}
 
 		// Create reverse proxy
@@ -910,19 +918,36 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 			// unparsable query parameters before calling Rewrite.
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				out := pr.Out
-				// Carry the client's Forwarded / X-Forwarded-For chain only when
-				// forwarded headers are trusted and the client did not mark them
-				// hop-by-hop; SetXForwarded appends the peer IP (or emits it alone).
-				if p.trustForwarded {
-					for _, h := range []string{"Forwarded", "X-Forwarded-For"} {
-						if v := pr.In.Header.Values(h); len(v) > 0 && !connectionNominates(pr.In.Header, h) {
-							out.Header[h] = v
-						}
-					}
+				// X-Forwarded-For: only the trusted suffix of the client chain
+				// (the hop-count-selected client IP through the rightmost entry,
+				// as for the rate-limit client IP), and only when the client did
+				// not mark it hop-by-hop. SetXForwarded then appends the peer IP,
+				// or emits it alone (untrusted, hop count 0, malformed or short
+				// chain). The inbound Forwarded header is never carried: it is
+				// not parsed, so it cannot be validated (ReverseProxy has already
+				// removed it).
+				if chain := handlerutils.TrustedXFFChain(pr.In); len(chain) > 0 && !connectionNominates(pr.In.Header, "X-Forwarded-For") {
+					out.Header.Set("X-Forwarded-For", strings.Join(chain, ", "))
 				}
 				pr.SetXForwarded()
 				out.Header.Set("X-Forwarded-Host", extHost)
 				out.Header.Set("X-Forwarded-Proto", extScheme)
+				// Other forwarding headers the proxy does not own are client
+				// injectable, so they are removed rather than passed through:
+				// X-Forwarded-Uri (only meaningful on a forward-auth check, which
+				// is not this path), X-Real-Ip (never set by this proxy; the
+				// client IP is conveyed by X-Forwarded-For), X-Forwarded-Port
+				// and X-Forwarded-Prefix (never set by this proxy), plus the
+				// request-path override family (X-Original-URL, X-Rewrite-URL,
+				// X-Original-URI, X-Forwarded-Path, X-Envoy-Original-Path) that
+				// some upstream frameworks honor in place of the request line,
+				// which would let a client change the path the upstream serves.
+				for _, h := range []string{
+					"X-Forwarded-Uri", "X-Real-Ip", "X-Forwarded-Port", "X-Forwarded-Prefix",
+					"X-Original-Url", "X-Rewrite-Url", "X-Original-Uri", "X-Forwarded-Path", "X-Envoy-Original-Path",
+				} {
+					out.Header.Del(h)
+				}
 
 				// Only scheme and host change; path and query stay as inbound
 				// (SetURL would join paths and is deliberately not used).
