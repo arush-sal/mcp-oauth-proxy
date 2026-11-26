@@ -172,3 +172,12 @@ func TestHTTPSRedirectHostsAllowsRedirectURI(t *testing.T) {
 	assert.True(t, p.AllowsRedirectURI("http://localhost:1/cb"))
 	assert.True(t, p.AllowsRedirectURI("cursor://x/cb"))
 }
+
+func TestParseHTTPSRedirectHostsIDNRequiresPunycode(t *testing.T) {
+	_, err := ParseHTTPSRedirectHosts("b\u00fccher.example")
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), "punycode")
+	}
+	_, err = ParseHTTPSRedirectHosts("xn--bcher-kva.example")
+	assert.NoError(t, err)
+}

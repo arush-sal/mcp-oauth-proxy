@@ -93,7 +93,7 @@ func ParseHTTPSRedirectHosts(raw string) (*HTTPSRedirectHosts, error) {
 	}
 	for _, e := range entries {
 		if e == "none" || !validHostname(e) {
-			return nil, fmt.Errorf("DCR allowed redirect hosts: invalid entry %q: must be a bare hostname (no scheme, path, port or wildcard); use \"none\" alone to reject all https", e)
+			return nil, fmt.Errorf("DCR allowed redirect hosts: invalid entry %q: must be a bare hostname (no scheme, path, port or wildcard); internationalized hosts must be listed in punycode (xn--) form; use \"none\" alone to reject all https", e)
 		}
 		p.hosts[e] = struct{}{}
 	}

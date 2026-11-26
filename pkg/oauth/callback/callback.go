@@ -51,6 +51,8 @@ type Handler struct {
 	authorizer *authz.Authorizer
 	// session carries the resolved cookie/session lifetime and security policy.
 	session types.SessionConfig
+	// httpsHosts re-checks DCR_ALLOWED_REDIRECT_HOSTS (nil = unrestricted).
+	httpsHosts *handlerutils.HTTPSRedirectHosts
 }
 
 // MCPUIManager interface for generating JWT tokens
@@ -58,7 +60,7 @@ type MCPUIManager interface {
 	GenerateMCPUICodeForDownstream(bearerToken, refreshToken string) (string, error)
 }
 
-func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier, authorizer *authz.Authorizer, session types.SessionConfig) http.Handler {
+func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, clientID, clientSecret, routePrefix, cookieNamePrefix string, idTokenVerifier IDTokenVerifier, authorizer *authz.Authorizer, session types.SessionConfig, httpsHosts *handlerutils.HTTPSRedirectHosts) http.Handler {
 	return &Handler{
 		db:               db,
 		provider:         provider,
@@ -70,6 +72,7 @@ func NewHandler(db Store, provider providers.Provider, encryptionKey []byte, cli
 		idTokenVerifier:  idTokenVerifier,
 		authorizer:       authorizer,
 		session:          session,
+		httpsHosts:       httpsHosts,
 	}
 }
 
@@ -219,6 +222,17 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		State:               getStringFromMap(authData, "state"),
 		CodeChallenge:       getStringFromMap(authData, "code_challenge"),
 		CodeChallengeMethod: getStringFromMap(authData, "code_challenge_method"),
+	}
+
+	// Re-check DCR_ALLOWED_REDIRECT_HOSTS against the stored redirect_uri so a
+	// state created before the setting was tightened cannot complete. Nothing is
+	// consumed on rejection.
+	if !p.httpsHosts.AllowsRedirectURI(authReq.RedirectURI) {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_request",
+			ErrorDescription: "Invalid or expired state parameter",
+		})
+		return
 	}
 
 	// Clean up the auth request data after successful retrieval
