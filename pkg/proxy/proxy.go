@@ -889,32 +889,40 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 		// Log the proxy request for debugging
 		log.Printf("Proxying request: %s %s -> %s", r.Method, r.URL.Path, targetURL)
 
+		// The client-facing origin, derived exactly as for redirect URIs and
+		// metadata: the external base URL wins when configured, and forwarded
+		// headers are honored only under the trust policy. It feeds
+		// X-Forwarded-Host/-Proto and the Location rewrite below.
+		extScheme := "http"
+		if handlerutils.RequestIsHTTPS(r) {
+			extScheme = "https"
+		}
+		extHost := r.Host
+		if u, err := url.Parse(handlerutils.GetBaseURL(r)); err == nil && u.Host != "" {
+			extHost = u.Host
+		}
+
 		// Create reverse proxy
 		proxy := &httputil.ReverseProxy{
-			// Rewrite (not the deprecated Director) runs after hop-by-hop
-			// removal, so a client's Connection header cannot drop the headers
-			// written here. ReverseProxy strips inbound Forwarded and
-			// X-Forwarded-For/Host/Proto before calling Rewrite; they are
-			// re-set below to match the previous Director behavior.
+			// Rewrite runs after hop-by-hop removal, so a client's Connection
+			// header cannot drop the headers written here. ReverseProxy strips
+			// inbound Forwarded and X-Forwarded-For/Host/Proto and drops
+			// unparsable query parameters before calling Rewrite.
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				out := pr.Out
-				// Keep the client's Forwarded and X-Forwarded-For chain (the
-				// peer IP is appended by SetXForwarded), as Director did.
-				// SetXForwarded sets X-Forwarded-Host to the inbound Host;
-				// X-Forwarded-Proto is then reset to the inbound URL scheme
-				// (empty for server requests), which is what Director sent.
-				if v := pr.In.Header.Values("Forwarded"); len(v) > 0 {
-					out.Header["Forwarded"] = v
+				// Carry the client's Forwarded / X-Forwarded-For chain only when
+				// forwarded headers are trusted and the client did not mark them
+				// hop-by-hop; SetXForwarded appends the peer IP (or emits it alone).
+				if p.trustForwarded {
+					for _, h := range []string{"Forwarded", "X-Forwarded-For"} {
+						if v := pr.In.Header.Values(h); len(v) > 0 && !connectionNominates(pr.In.Header, h) {
+							out.Header[h] = v
+						}
+					}
 				}
-				out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"]
 				pr.SetXForwarded()
-				out.Header.Set("X-Forwarded-Proto", pr.In.URL.Scheme)
-
-				// Rewrite always drops unparsable query params; Director only did
-				// so when the inbound form had been parsed. Keep the raw query.
-				if pr.In.Form == nil {
-					out.URL.RawQuery = pr.In.URL.RawQuery
-				}
+				out.Header.Set("X-Forwarded-Host", extHost)
+				out.Header.Set("X-Forwarded-Proto", extScheme)
 
 				// Only scheme and host change; path and query stay as inbound
 				// (SetURL would join paths and is deliberately not used).
@@ -933,16 +941,14 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 				// Rewrite Location header to use proxy host instead of downstream server host
 				if location := resp.Header.Get("Location"); location != "" {
 					if locationURL, err := url.Parse(location); err == nil {
-						// Get the original request to extract proxy host
-						proxyHost := resp.Request.Header.Get("X-Forwarded-Host")
-						if proxyHost != "" {
+						if extHost != "" {
 							// Parse downstream server URL to get scheme
 							downstreamURL, _ := url.Parse(p.GetMCPServerURL())
 
 							// Only rewrite if the location points to the downstream server
 							if locationURL.Host == downstreamURL.Host {
-								locationURL.Scheme = resp.Request.URL.Scheme
-								locationURL.Host = proxyHost
+								locationURL.Scheme = extScheme
+								locationURL.Host = extHost
 								resp.Header.Set("Location", locationURL.String())
 							}
 						}
@@ -959,6 +965,19 @@ func (p *OAuthProxy) mcpProxyHandler(w http.ResponseWriter, r *http.Request, nex
 		// Serve the proxied request
 		proxy.ServeHTTP(w, r)
 	}
+}
+
+// connectionNominates reports whether the Connection header lists name as a
+// hop-by-hop header (RFC 9110 7.6.1).
+func connectionNominates(h http.Header, name string) bool {
+	for _, v := range h.Values("Connection") {
+		for tok := range strings.SplitSeq(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), name) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // setHeaders writes the X-Forwarded-* identity headers from the grant props and
