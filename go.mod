@@ -2,7 +2,7 @@ module github.com/obot-platform/mcp-oauth-proxy
 
 go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.26.11
 
 require (
 	github.com/MicahParks/jwkset v0.12.0
