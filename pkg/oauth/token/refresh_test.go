@@ -330,6 +330,51 @@ func TestAuthorizationCodeGrant_ConfidentialClientNoPKCESucceeds(t *testing.T) {
 	assert.True(t, store.codeConsumed)
 }
 
+// TestAuthorizationCodeGrant_LoopbackRedirectAnyPort verifies RFC 8252 section
+// 7.3 at the token endpoint: a redirect_uri whose only difference from the
+// registered http loopback URI is the port is accepted; a different path is
+// rejected with invalid_grant.
+func TestAuthorizationCodeGrant_LoopbackRedirectAnyPort(t *testing.T) {
+	authCodeReqWithRedirect := func(redirectURI string) *http.Request {
+		form := url.Values{}
+		form.Set("grant_type", "authorization_code")
+		form.Set("code", "the-code")
+		form.Set("client_id", "client")
+		form.Set("code_verifier", "the-verifier")
+		form.Set("redirect_uri", redirectURI)
+		req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req
+	}
+
+	t.Run("different port accepted", func(t *testing.T) {
+		store := authCodeStore(t)
+		store.client.RedirectUris = []string{"http://localhost:40001/callback"}
+		h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authCodeReqWithRedirect("http://localhost:40002/callback"))
+
+		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+		assert.Len(t, store.stored, 1)
+		assert.True(t, store.codeConsumed)
+	})
+
+	t.Run("different path rejected", func(t *testing.T) {
+		store := authCodeStore(t)
+		store.client.RedirectUris = []string{"http://localhost:40001/callback"}
+		h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, authCodeReqWithRedirect("http://localhost:40002/evil"))
+
+		assert.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "invalid_grant")
+		assert.Empty(t, store.stored)
+		assert.False(t, store.codeConsumed)
+	})
+}
+
 func TestAuthorizationCodeGrant_RejectsMissingPKCEVerifier(t *testing.T) {
 	store := authCodeStore(t)
 	h := NewHandler(store, nil, make([]byte, 32), defaultSession())

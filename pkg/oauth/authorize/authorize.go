@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 
 	"github.com/obot-platform/mcp-oauth-proxy/pkg/encryption"
@@ -104,7 +103,7 @@ func (p *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !slices.Contains(clientInfo.RedirectUris, authReq.RedirectURI) {
+	if !handlerutils.RedirectURIMatches(clientInfo.RedirectUris, authReq.RedirectURI) {
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 			Error:            "invalid_request",
 			ErrorDescription: "Invalid redirect URI",

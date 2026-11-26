@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -161,7 +160,7 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 	// Validate redirect_uri if provided
 	if redirectURI != "" {
 		// Check if redirect URI is registered for this client
-		if !slices.Contains(clientInfo.RedirectUris, redirectURI) {
+		if !handlerutils.RedirectURIMatches(clientInfo.RedirectUris, redirectURI) {
 			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 				Error:            "invalid_grant",
 				ErrorDescription: "Invalid redirect URI",

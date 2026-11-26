@@ -108,6 +108,35 @@ func TestAuthorizePublicClientRequiresS256(t *testing.T) {
 	})
 }
 
+// TestAuthorizeLoopbackRedirectAnyPort verifies RFC 8252 section 7.3: a public
+// client that registered an http loopback redirect URI may re-use the client_id
+// with a different loopback port (Claude Code binds a new random callback port
+// on each sign-in). A different port passes; a different path is still rejected.
+func TestAuthorizeLoopbackRedirectAnyPort(t *testing.T) {
+	const registered = "http://localhost:40001/callback"
+	publicClient := &types.ClientInfo{
+		ClientID:                "public",
+		TokenEndpointAuthMethod: "none",
+		RedirectUris:            []string{registered},
+	}
+
+	t.Run("different port accepted", func(t *testing.T) {
+		h, store := newHandlerFor(publicClient)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, newAuthorizeRequest("public", "http://localhost:40002/callback", "abc123challenge", "S256"))
+		require.Equal(t, http.StatusFound, w.Code, "body: %s", w.Body.String())
+		assert.Len(t, store.stored, 1)
+	})
+
+	t.Run("different path rejected", func(t *testing.T) {
+		h, _ := newHandlerFor(publicClient)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, newAuthorizeRequest("public", "http://localhost:40002/evil", "abc123challenge", "S256"))
+		require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+		assert.Contains(t, w.Body.String(), "Invalid redirect URI")
+	})
+}
+
 // TestAuthorizeConfidentialClientChallengeOptional proves confidential clients
 // (those with a client secret) keep the pre-H1 behavior: a missing
 // code_challenge is still allowed.
