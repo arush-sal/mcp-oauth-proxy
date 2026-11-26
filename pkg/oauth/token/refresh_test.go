@@ -683,3 +683,36 @@ func TestAuthorizationCodeGrant_RedirectURIMismatchDoesNotBurnCode(t *testing.T)
 	assert.True(t, store.codeConsumed)
 	assert.Len(t, store.stored, 1)
 }
+
+// TestAuthorizationCodeGrant_BoundGrantWithoutPKCEOmittedRedirect pins the
+// error ordering for a bound grant that used no PKCE: omitting redirect_uri is
+// rejected by the pre-existing "redirect_uri is required when not using PKCE"
+// check (invalid_request) before the binding check runs, and the code is not
+// consumed.
+func TestAuthorizationCodeGrant_BoundGrantWithoutPKCEOmittedRedirect(t *testing.T) {
+	const bound = "https://app.example/cb"
+	store := authCodeStore(t)
+	store.client.TokenEndpointAuthMethod = "client_secret_post"
+	store.client.ClientSecret = "the-secret"
+	store.client.RedirectUris = []string{bound}
+	store.grant.RedirectURI = bound
+	store.grant.CodeChallenge = ""
+	store.grant.CodeChallengeMethod = ""
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", "the-code")
+	form.Set("client_id", "client")
+	form.Set("client_secret", "the-secret")
+	req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "invalid_request")
+	assert.Contains(t, rec.Body.String(), "redirect_uri is required when not using PKCE")
+	assert.False(t, store.codeConsumed)
+	assert.Empty(t, store.stored)
+}
