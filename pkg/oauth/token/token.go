@@ -172,11 +172,6 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		// deliberately looser (loopback any-port) and would let a code be
 		// redeemed against a different listener. Legacy grants created before
 		// RedirectURI was persisted have it empty and keep the registration check.
-		//
-		// Omission stays allowed when PKCE is used (checked below): OAuth 2.1
-		// (draft-ietf-oauth-v2-1-17 section 10.2) drops redirect_uri from the token
-		// request because PKCE already prevents code injection, so 2.1-only
-		// clients will not send it. Without PKCE it is still required.
 		if grant.RedirectURI != "" && redirectURI != grant.RedirectURI {
 			handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 				Error:            "invalid_grant",
@@ -231,6 +226,20 @@ func (p *Handler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Re
 		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
 			Error:            "invalid_request",
 			ErrorDescription: "redirect_uri is required when not using PKCE",
+		})
+		return
+	}
+
+	// A bound grant may omit redirect_uri only under S256 PKCE: OAuth 2.1
+	// (draft-ietf-oauth-v2-1-17 section 10.2) drops redirect_uri from the token
+	// request because PKCE prevents code injection, so 2.1-only clients will not
+	// send it. That argument fails for plain (or any non-S256) PKCE, whose
+	// verifier equals the challenge exposed in the authorize URL, so those grants
+	// (confidential clients only) still require it per RFC 6749 4.1.3.
+	if grant.RedirectURI != "" && redirectURI == "" && grant.CodeChallengeMethod != "S256" {
+		handlerutils.JSON(w, http.StatusBadRequest, types.OAuthError{
+			Error:            "invalid_grant",
+			ErrorDescription: "redirect_uri is required unless S256 PKCE is used",
 		})
 		return
 	}

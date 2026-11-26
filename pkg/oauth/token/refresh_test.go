@@ -588,7 +588,8 @@ func TestAuthorizationCodeGrant_RedirectURIBoundToAuthorizeRequest(t *testing.T)
 		name         string
 		grantURI     string // grant.RedirectURI ("" = legacy grant)
 		sent         string // form redirect_uri ("" = omitted)
-		confidential bool   // confidential client without PKCE
+		confidential bool   // confidential client
+		method       string // confidential only: PKCE method ("" = no PKCE)
 		wantOK       bool
 	}{
 		{name: "identical URI succeeds", grantURI: bound, sent: bound, wantOK: true},
@@ -597,6 +598,9 @@ func TestAuthorizationCodeGrant_RedirectURIBoundToAuthorizeRequest(t *testing.T)
 		{name: "case-different scheme fails", grantURI: bound, sent: "HTTP://127.0.0.1:5000/cb"},
 		{name: "omitted with PKCE succeeds (OAuth 2.1 10.2)", grantURI: bound, sent: "", wantOK: true},
 		{name: "omitted without PKCE fails", grantURI: bound, sent: "", confidential: true},
+		{name: "omitted with plain PKCE fails", grantURI: bound, sent: "", confidential: true, method: "plain"},
+		{name: "omitted with unknown PKCE method fails", grantURI: bound, sent: "", confidential: true, method: "S512"},
+		{name: "plain PKCE with identical URI succeeds", grantURI: bound, sent: bound, confidential: true, method: "plain", wantOK: true},
 		{name: "legacy grant accepts any registered URI", grantURI: "", sent: "https://app.example/cb", wantOK: true},
 		{name: "legacy grant accepts loopback port variant", grantURI: "", sent: "http://127.0.0.1:6000/cb", wantOK: true},
 		{name: "unregistered URI still fails", grantURI: "https://evil.example/cb", sent: "https://evil.example/cb"},
@@ -615,7 +619,12 @@ func TestAuthorizationCodeGrant_RedirectURIBoundToAuthorizeRequest(t *testing.T)
 				store.client.TokenEndpointAuthMethod = "client_secret_post"
 				store.client.ClientSecret = "the-secret"
 				store.grant.CodeChallenge = ""
-				store.grant.CodeChallengeMethod = ""
+				store.grant.CodeChallengeMethod = tc.method
+				if tc.method != "" {
+					// Non-S256 methods compare the verifier to the challenge verbatim.
+					store.grant.CodeChallenge = "challenge"
+					form.Set("code_verifier", "challenge")
+				}
 				form.Set("client_secret", "the-secret")
 			} else {
 				form.Set("code_verifier", "the-verifier")
@@ -639,4 +648,38 @@ func TestAuthorizationCodeGrant_RedirectURIBoundToAuthorizeRequest(t *testing.T)
 			assert.False(t, store.codeConsumed, "a rejected exchange must not consume the code")
 		})
 	}
+}
+
+// TestAuthorizationCodeGrant_RedirectURIMismatchDoesNotBurnCode: a rejected
+// mismatch leaves the code redeemable by the legitimate client.
+func TestAuthorizationCodeGrant_RedirectURIMismatchDoesNotBurnCode(t *testing.T) {
+	const bound = "http://127.0.0.1:5000/cb"
+	store := authCodeStore(t)
+	store.client.RedirectUris = []string{bound}
+	store.grant.RedirectURI = bound
+	h := NewHandler(store, nil, make([]byte, 32), defaultSession())
+
+	send := func(uri string) *httptest.ResponseRecorder {
+		form := url.Values{}
+		form.Set("grant_type", "authorization_code")
+		form.Set("code", "the-code")
+		form.Set("client_id", "client")
+		form.Set("code_verifier", "the-verifier")
+		form.Set("redirect_uri", uri)
+		req := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := send("http://127.0.0.1:6000/cb")
+	require.Equal(t, http.StatusBadRequest, rec.Code, "body: %s", rec.Body.String())
+	assert.Contains(t, rec.Body.String(), "invalid_grant")
+	require.False(t, store.codeConsumed)
+
+	rec = send(bound)
+	require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
+	assert.True(t, store.codeConsumed)
+	assert.Len(t, store.stored, 1)
 }
